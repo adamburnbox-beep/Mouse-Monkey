@@ -1,0 +1,11 @@
+/home/arosa/Code Projects/Mouse Monkey/target/release/deps/xkbcommon-465b2937d53c4961.d: /home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/lib.rs /home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/xkb/mod.rs /home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/xkb/compose.rs /home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/xkb/ffi.rs /home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/xkb/keysyms.rs
+
+/home/arosa/Code Projects/Mouse Monkey/target/release/deps/libxkbcommon-465b2937d53c4961.rlib: /home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/lib.rs /home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/xkb/mod.rs /home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/xkb/compose.rs /home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/xkb/ffi.rs /home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/xkb/keysyms.rs
+
+/home/arosa/Code Projects/Mouse Monkey/target/release/deps/libxkbcommon-465b2937d53c4961.rmeta: /home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/lib.rs /home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/xkb/mod.rs /home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/xkb/compose.rs /home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/xkb/ffi.rs /home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/xkb/keysyms.rs
+
+/home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/lib.rs:
+/home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/xkb/mod.rs:
+/home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/xkb/compose.rs:
+/home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/xkb/ffi.rs:
+/home/arosa/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xkbcommon-0.7.0/src/xkb/keysyms.rs:

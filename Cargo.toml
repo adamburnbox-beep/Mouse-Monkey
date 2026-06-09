@@ -1,0 +1,34 @@
+# /home/arosa/Code Projects/Cargo.toml
+[package]
+name = "monkey_companion"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "monkey_companion"
+path = "src/main.rs"
+
+[dependencies]
+# Add the dependencies as specified in the project plan
+toml = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+rand = "0.8"
+image = "0.24" # Or "png" if you prefer
+crossbeam-channel = "0.5.11" # For inter-thread communication across platforms
+
+# Platform-specific dependencies
+[target.'cfg(target_os = "linux")'.dependencies]
+sctk = { package = "smithay-client-toolkit", version = "0.18"}
+evdev = "0.12.1"
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58.0", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+]}
