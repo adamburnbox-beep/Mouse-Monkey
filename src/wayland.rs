@@ -16,7 +16,7 @@ use sctk::{
     reexports::client::{
         globals::registry_queue_init,
         protocol::{wl_output, wl_pointer, wl_region, wl_seat, wl_surface},
-        Connection, QueueHandle, WEnum,
+        Connection, QueueHandle,
     },
     registry::{ProvidesRegistryState, RegistryState},
     compositor::{CompositorHandler, CompositorState},

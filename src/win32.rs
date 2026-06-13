@@ -3,7 +3,7 @@
 use crate::config::AppConfig;
 use crate::platform::{InputEvent, MouseButton, PlatformDriver, Rect};
 use crate::sprite_renderer::SpriteData;
-use log::{error, info, warn};
+use log::{debug, error, info};
 use std::io::{self, Write};
 use std::ptr;
 use std::sync::{Arc, Mutex};
@@ -11,26 +11,26 @@ use std::thread;
 use std::time::Duration;
 
 use windows::{
-    core::{PCWSTR, HRESULT},
+    core::PCWSTR,
     Win32::{
         Foundation::{BOOL, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::Gdi::{
-            EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, MONITORINFOEXW,
-            MONITOR_DEFAULTTONEAREST, HMONITOR, HDC,
+            EnumDisplayMonitors, GetMonitorInfoW, MONITORINFOEXW, HMONITOR, HDC,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Input::KeyboardAndMouse::{
-                SetWindowsHookExW, UnhookWindowsHookEx, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT,
+                SetWindowsHookExW, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT,
                 WH_KEYBOARD_LL, WH_MOUSE_LL, HHOOK,
             },
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-                GetMessageW, GetWindowLongPtrW, PostQuitMessage, RegisterClassExW, SetWindowLongPtrW,
+                GetWindowLongPtrW, RegisterClassExW, SetWindowLongPtrW,
                 SetWindowPos, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, MSG,
                 SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WM_CLOSE, WM_CREATE,
-                WM_DISPLAYCHANGE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-                WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_QUIT, WNDCLASSEXW, WS_EX_LAYERED,
+                WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+                WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+                WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_EX_LAYERED,
                 WS_EX_TRANSPARENT, WS_POPUP, PeekMessageW, PM_REMOVE,
             },
         },
@@ -335,12 +335,12 @@ impl PlatformDriver for Win32Driver {
     }
 
     fn render_frame(&mut self, sprite_data: &SpriteData) -> io::Result<()> {
-        // Placeholder for wgpu rendering.
-        // This would involve creating a wgpu surface from the HWND,
-        // setting up a render pipeline, and drawing the sprite.
-        info!(
-            "Win32Driver: Rendering frame with texture_id: {}",
-            sprite_data.texture_id
+        // Placeholder for the layered-window blit.
+        // A full implementation would build a 32-bit premultiplied DIB from the
+        // sprite tile and push it to the layered window via UpdateLayeredWindow.
+        debug!(
+            "Win32Driver: render frame at {:?} scale {:?} uv {:?}",
+            sprite_data.position, sprite_data.scale, sprite_data.uv_rect
         );
         Ok(())
     }
@@ -351,7 +351,7 @@ impl PlatformDriver for Win32Driver {
 
     fn set_window_position(&mut self, x: i32, y: i32) {
         unsafe {
-            SetWindowPos(
+            if let Err(e) = SetWindowPos(
                 self.hwnd,
                 None,
                 x,
@@ -359,14 +359,15 @@ impl PlatformDriver for Win32Driver {
                 0,
                 0,
                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to set window position: {}", e)))?;
+            ) {
+                error!("Failed to set window position: {}", e);
+            }
         }
-        Ok(())
     }
 
     fn set_window_size(&mut self, width: u32, height: u32) {
         unsafe {
-            SetWindowPos(
+            if let Err(e) = SetWindowPos(
                 self.hwnd,
                 None,
                 0,
@@ -374,9 +375,10 @@ impl PlatformDriver for Win32Driver {
                 width as i32,
                 height as i32,
                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-            ).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to set window size: {}", e)))?;
+            ) {
+                error!("Failed to set window size: {}", e);
+            }
         }
-        Ok(())
     }
 
     fn is_running(&self) -> bool {
@@ -391,11 +393,9 @@ impl PlatformDriver for Win32Driver {
     fn get_cursor_pos(&self) -> (f32, f32) {
         let mut point = windows::Win32::Foundation::POINT::default();
         unsafe {
-            GetCursorPos(&mut point).unwrap_or_else(|e| { // unwrap_or_else to avoid panic, but log error
+            if let Err(e) = GetCursorPos(&mut point) {
                 error!("Failed to get cursor position: {}", e);
-                // Return a default or last known position if getting current fails
-                HRESULT(0) // Indicate failure, but continue
-            });
+            }
         }
         (point.x as f32, point.y as f32)
     }

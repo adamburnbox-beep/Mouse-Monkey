@@ -90,7 +90,7 @@ fn main() -> io::Result<()> {
                 sprite_sheet.frame_width,
                 sprite_sheet.frame_height,
             ),
-            position: monkey.position,
+            position: monkey.render_position(),
             scale: monkey.scale,
         };
         platform_driver.render_frame(&sprite_data)?;

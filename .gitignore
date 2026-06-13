@@ -1,0 +1,10 @@
+# Rust build artifacts
+/target
+
+# Compiled test binaries / scratch builds
+/test_dev
+
+# Local run logs
+run.log
+run_info.log
+run_test.log
