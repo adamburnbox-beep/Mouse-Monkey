@@ -21,7 +21,7 @@ USAGE:
 OPTIONS:
     -c, --config <PATH>   Use this config file instead of searching the standard locations
         --check           Load the config and sprite sheet, report what was found, then exit
-        --self-test       Run the engine headlessly for a few seconds and report the result
+        --self-test       Simulate ten seconds of the engine headlessly, then report
         --print-config    Print the effective configuration as TOML and exit
     -v, --verbose         Log at debug level (same as RUST_LOG=debug)
     -h, --help            Show this help and exit

@@ -48,7 +48,7 @@ Windows needs only a stable Rust toolchain with the MSVC target.
 ```sh
 monkey_companion                    # run it
 monkey_companion --check            # validate config and assets, then exit
-monkey_companion --self-test        # run the engine headlessly for 10 seconds
+monkey_companion --self-test        # simulate 10s of the engine, no display needed
 monkey_companion --print-config     # dump the effective configuration
 monkey_companion --config ./my.toml # use a specific config file
 monkey_companion --help
@@ -165,6 +165,99 @@ input before it is routed to a window.
 Where the original spec fixed a value per frame at 60 Hz, the implementation
 stores it per second instead, so changing `tick_rate_hz` changes the smoothness
 and not the behaviour.
+
+---
+
+## Testing it by hand
+
+Work outwards from the checks that need nothing, to the ones that need a real
+desktop session.
+
+### 1. Without a display
+
+```sh
+cargo test          # the state machine, monitor maths, config, assets, the loop
+cargo run -- --check       # config and sprite sheet load
+cargo run -- --self-test   # the real engine loop, headless
+```
+
+`--self-test` runs the same `App::run` path the overlay uses, against the
+headless driver. If it prints a frame count and a state, the engine works; only
+the windowing and input code is left to verify.
+
+### 2. Make the slow behaviours fast
+
+Several behaviours are deliberately rare — the hunt waits five minutes, the
+idle twitch is a one-in-five roll every eight seconds. Testing those at their
+shipped values is tedious, so override them. Save this as `test.toml` **in the
+repository root** (relative sprite paths resolve against the config file):
+
+```toml
+[behaviour]
+hunt_after_idle_secs = 5.0     # walk to the cursor after 5s, not 5 minutes
+groom_hold_secs = 0.5          # groom almost immediately
+wiggle_interval_secs = 2.0     # twitch every 2s...
+wiggle_chance = 1.0            # ...every time
+```
+
+```sh
+cargo run --release -- --config test.toml --verbose
+```
+
+`--verbose` logs every state transition, so you can see what the monkey thinks
+it is doing even when the animation is ambiguous.
+
+### 3. What to try, and what should happen
+
+| Do this | Expect |
+|---|---|
+| Move the cursor in a circle around the monkey | its pose changes as you cross each of the eight directions (`gaze` in the logs) |
+| Type anywhere, in any window | it scratches its head, and stops ~750 ms after you do |
+| Click and drag it | it follows the pointer, stretching vertically as you pull down and squashing as you push up |
+| Drag it, then flick the mouse hard and let go | it drops, tumbles, and falls to the bottom of the monitor |
+| Rest the cursor on it and stop moving | after `groom_hold_secs` it grooms itself and breathes gently |
+| Leave the mouse alone for `hunt_after_idle_secs` | it walks across the screen to the cursor and stops |
+| Drag it towards a screen edge and release | it stays fully on screen |
+| Click *next to* the monkey, on the window below | that window gets the click; the overlay is not in the way |
+| Unplug or disable a monitor while it is running | it re-appears on a remaining monitor |
+| Press Ctrl-C in the terminal | it exits cleanly, with a frame count |
+
+### 4. Read the startup log
+
+The first few lines tell you most of what you need:
+
+```
+loaded sprite sheet '...': 1024x1024, 8x8 frames of 128x128 (4.0 MiB in memory)
+output topology: 1 monitor(s) [Rect { x: 0, y: 0, width: 3440, height: 1440 }]
+evdev: keyboard /dev/input/event3 (AT Translated Set 2 keyboard)
+evdev: pointer /dev/input/event5 (Logitech MX Master 3)
+```
+
+A `warning: global input capture is unavailable` line means the companion is in
+window-local fallback mode — see [Permissions](#permissions). It will still
+run, but it will only notice the pointer near the sprite and will not react to
+typing at all.
+
+### 5. Check the footprint
+
+```sh
+/usr/bin/time -v ./target/release/monkey_companion --self-test 2>&1 | grep Maximum
+ps -o rss= -p "$(pgrep monkey_companion)"   # while it is actually running
+```
+
+Expect roughly 11 MB headless and around 20 MB with a 1920x1080 overlay
+surface, against the 45 MB budget in the spec.
+
+### Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `this compositor does not support wlr-layer-shell` | you are on GNOME/Mutter; try Sway, KDE, Hyprland or COSMIC |
+| `cannot connect to a Wayland compositor` | running under X11 or over SSH without `WAYLAND_DISPLAY` |
+| It ignores typing, and only notices the mouse nearby | not in the `input` group — see [Permissions](#permissions) |
+| It never grooms | the cursor is not quite still; raise `groom_velocity_px_per_sec` |
+| It gets flung when you meant to drag | lower `fling_acceleration_px_per_sec2` |
+| Nothing visible at all | check `--check` passes, then run with `--verbose` and look for a configure line |
 
 ---
 
