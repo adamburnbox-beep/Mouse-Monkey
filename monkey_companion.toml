@@ -1,10 +1,76 @@
+# Mouse Monkey configuration.
+#
+# Every key below is optional: anything you leave out falls back to the built-in
+# default shown here. Run `monkey_companion --print-config` to see the values
+# actually in effect, and `monkey_companion --check` to validate a change
+# without starting the overlay.
+
+# Overlay size hint, in logical pixels. The Wayland driver lets the compositor
+# size the layer surface; the Win32 driver always spans the whole desktop.
 window_width = 1920
 window_height = 1080
 window_title = "Mouse Monkey Companion"
+
+# Simulation and redraw rate (1-480).
 tick_rate_hz = 60
 
 [sprite]
+# Relative paths are resolved against this file, then the working directory,
+# then the directory holding the executable.
 sheet_path = "assets/sprites/monkey_directional.png"
 frame_width = 128
 frame_height = 128
 render_scale = 1.0
+
+[behaviour]
+# FR-04 — walking to a cursor that has not moved.
+hunt_after_idle_secs = 300.0
+hunt_speed_px_per_sec = 180.0
+hunt_arrival_px = 10.0
+
+# FR-05 — grooming when a still cursor rests on the sprite.
+groom_velocity_px_per_sec = 0.05
+groom_hold_secs = 2.0
+breathing_amplitude = 0.02
+breathing_hz = 1.0
+
+# FR-06 — reacting to typing.
+scratch_decay_ms = 750
+
+# FR-07 — idle twitches.
+wiggle_interval_secs = 8.333
+wiggle_chance = 0.2
+wiggle_duration_ms = 400
+wiggle_amplitude_px = 2.0
+wiggle_hz = 6.0
+
+# FR-03 — squash and stretch while held. The horizontal squish is always half
+# the vertical stretch, which keeps the sprite's area roughly constant.
+drag_stretch_per_px = 0.05
+drag_relax_per_sec = 6.0
+drag_scale_limit = 0.5
+
+# FR-08 — being flung, and falling.
+fling_acceleration_px_per_sec2 = 35000.0
+gravity_px_per_sec2 = 588.0
+landing_bounce = 0.0
+
+[animation]
+# Cells of the sheet each animation uses. The bundled 8x8 sheet has standing
+# poses with varying gaze on rows 0-5, grooming and head-scratching on row 6,
+# and surprised and tumbling poses on row 7.
+gaze_row = 1
+walk_row = 3
+walk_fps = 8.0
+groom_row = 6
+groom_first_column = 1
+groom_frames = 3
+groom_fps = 6.0
+scratch_row = 6
+scratch_first_column = 4
+scratch_frames = 4
+scratch_fps = 12.0
+drag_row = 7
+drag_column = 0
+tumble_row = 7
+tumble_fps = 10.0

@@ -1,28 +1,40 @@
-# /home/arosa/Code Projects/Cargo.toml
 [package]
 name = "monkey_companion"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+rust-version = "1.74"
+description = "A lightweight on-screen monkey companion that reacts to your mouse and keyboard."
+authors = ["Mouse Monkey contributors"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/adamburnbox-beep/mouse-monkey"
+keywords = ["desktop-pet", "overlay", "wayland", "win32", "companion"]
+categories = ["games"]
+exclude = ["/docs", "/.github"]
+
+[lib]
+name = "monkey_companion"
+path = "src/lib.rs"
 
 [[bin]]
 name = "monkey_companion"
 path = "src/main.rs"
 
 [dependencies]
-# Add the dependencies as specified in the project plan
-toml = "0.8"
-serde = { version = "1.0", features = ["derive"] }
+crossbeam-channel = "0.5.11"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+# Only the PNG decoder is enabled: every other format is dead weight in both
+# binary size and audited dependency surface.
+image = { version = "0.24", default-features = false, features = ["png"] }
 log = "0.4"
-env_logger = "0.11"
-rand = "0.8"
-image = "0.24" # Or "png" if you prefer
-crossbeam-channel = "0.5.11" # For inter-thread communication across platforms
+rand = { version = "0.8", default-features = false, features = ["small_rng", "std", "std_rng"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
 
-# Platform-specific dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
-sctk = { package = "smithay-client-toolkit", version = "0.18"}
 evdev = "0.12.1"
 libc = "0.2"
+sctk = { package = "smithay-client-toolkit", version = "0.18" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58.0", features = [
@@ -31,4 +43,20 @@ windows = { version = "0.58.0", features = [
     "Win32_System_LibraryLoader",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
-]}
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[lints.rust]
+missing_debug_implementations = "warn"
+rust_2018_idioms = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
