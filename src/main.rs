@@ -1,107 +1,123 @@
-mod config;
-mod platform;
-mod sprite_renderer;
-mod state;
-mod monkey;
+//! Binary entry point: parse arguments, build the app, pick a driver, run.
 
-#[cfg(target_os = "linux")]
-mod wayland;
-#[cfg(target_os = "windows")]
-mod win32;
+use std::process::ExitCode;
+use std::time::Duration;
 
-use crate::config::AppConfig;
-use crate::platform::PlatformDriver;
-use crate::sprite_renderer::{SpriteSheet, SpriteData};
-use crate::monkey::Monkey;
-use std::io;
-use std::time::{Duration, Instant};
-use log::info;
+use monkey_companion::app::App;
+use monkey_companion::cli::{Cli, Command};
+use monkey_companion::config::AppConfig;
+use monkey_companion::error::Result;
+use monkey_companion::platform::headless::HeadlessDriver;
+use monkey_companion::platform::PlatformDriver;
+use monkey_companion::shutdown::ShutdownSignal;
 
-fn main() -> io::Result<()> {
-    env_logger::init();
-    info!("Starting monkey_companion application...");
-
-    // 1. Load configuration
-    // Assumes 'monkey_companion.toml' exists in the project root.
-    let config = AppConfig::load("monkey_companion.toml")?;
-    info!("Configuration loaded: {:?}", config);
-
-    // 2. Initialize PlatformDriver based on target OS
-    // This uses conditional compilation to select the correct driver.
-    #[cfg(target_os = "linux")]
-    let mut platform_driver = wayland::WaylandDriver::new(&config)?;
-    #[cfg(target_os = "windows")]
-    let mut platform_driver = win32::Win32Driver::new(&config)?;
-
-    // 3. Create window
-    platform_driver.create_window(
-        config.window_width,
-        config.window_height,
-        &config.window_title,
-    )?;
-
-    // 4. Load sprite sheet
-    let sprite_sheet = SpriteSheet::new(
-        &config.sprite.sheet_path,
-        config.sprite.frame_width,
-        config.sprite.frame_height,
-        config.sprite.render_scale,
-    );
-
-    // 5. Initialize Monkey
-    let initial_monkey_pos = (
-        (config.window_width / 2) as f32,
-        (config.window_height / 2) as f32,
-    );
-    let mut monkey = Monkey::new(
-        initial_monkey_pos,
-        sprite_sheet.frame_width,
-        sprite_sheet.frame_height,
-    );
-
-    let target_frame_duration = Duration::from_secs_f32(1.0 / config.tick_rate_hz as f32);
-    let mut last_frame_time = Instant::now();
-
-    // Main application loop
-    while platform_driver.is_running() {
-        let current_time = Instant::now();
-        let elapsed_time = current_time.duration_since(last_frame_time);
-        last_frame_time = current_time;
-        let dt = elapsed_time.as_secs_f32(); // Delta time in seconds
-
-        // Input processing
-        let input_events = platform_driver.poll_events();
-        for event in &input_events {
-            if let crate::platform::InputEvent::CloseRequested = event {
-                info!("Close requested. Shutting down.");
-                return Ok(());
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            // The logger may not be up yet, and a startup failure is something
+            // the user needs to see even with logging turned off.
+            eprintln!("monkey_companion: {error}");
+            let mut source = std::error::Error::source(&error);
+            while let Some(cause) = source {
+                eprintln!("  caused by: {cause}");
+                source = cause.source();
             }
-        }
-
-        // State updates (physics, animations, state transitions)
-        monkey.tick(&input_events, dt, &platform_driver);
-
-        // Rendering
-        let sprite_data = SpriteData {
-            sprite_sheet: &sprite_sheet,
-            uv_rect: (
-                monkey.current_animation_frame_index * sprite_sheet.frame_width,
-                monkey.current_animation_row * sprite_sheet.frame_height,
-                sprite_sheet.frame_width,
-                sprite_sheet.frame_height,
-            ),
-            position: monkey.position,
-            scale: monkey.scale,
-        };
-        platform_driver.render_frame(&sprite_data)?;
-
-        // Frame rate control
-        let frame_duration = Instant::now().duration_since(current_time);
-        if frame_duration < target_frame_duration {
-            std::thread::sleep(target_frame_duration - frame_duration);
+            ExitCode::FAILURE
         }
     }
+}
 
-    info!("Application shut down gracefully.");
-    Ok(())
+fn run() -> Result<()> {
+    let cli = Cli::from_env()?;
+
+    if let Command::Print(text) = &cli.command {
+        print!("{text}");
+        return Ok(());
+    }
+
+    init_logging(cli.verbose);
+
+    let config = match &cli.config_path {
+        Some(path) => AppConfig::load(path)?,
+        None => AppConfig::load_default()?,
+    };
+    log::debug!("effective configuration: {config:?}");
+
+    if cli.command == Command::PrintConfig {
+        match toml::to_string_pretty(&config) {
+            Ok(text) => print!("{text}"),
+            Err(error) => log::error!("cannot serialise config: {error}"),
+        }
+        return Ok(());
+    }
+
+    let mut app = App::new(config)?;
+
+    match cli.command {
+        Command::Check => {
+            let config = app.config();
+            println!("configuration: {}", describe_source(config));
+            println!("sprite sheet:  {}", config.resolved_sheet_path().display());
+            println!("tick rate:     {} Hz", config.tick_rate_hz);
+            println!("everything loads.");
+            Ok(())
+        }
+        Command::SelfTest => {
+            let mut driver = HeadlessDriver::new(1920, 1080);
+            app.run_fixed(&mut driver, 600, Duration::from_micros(16_667))?;
+            println!(
+                "self-test: {} frame(s) rendered, final state {}, position {:?}",
+                app.frames(),
+                app.monkey().state(),
+                app.monkey().position()
+            );
+            Ok(())
+        }
+        _ => {
+            let shutdown = ShutdownSignal::new();
+            shutdown.install_handlers();
+            let mut driver = platform_driver(app.config())?;
+            app.run(driver.as_mut(), &shutdown)
+        }
+    }
+}
+
+/// Build the driver for this target.
+#[allow(unused_variables)]
+fn platform_driver(config: &AppConfig) -> Result<Box<dyn PlatformDriver>> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(Box::new(
+            monkey_companion::platform::wayland::WaylandDriver::new(config)?,
+        ))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Ok(Box::new(
+            monkey_companion::platform::win32::Win32Driver::new(config)?,
+        ))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        Err(monkey_companion::error::Error::Platform(format!(
+            "{} is not supported; only Linux (Wayland) and Windows have drivers. \
+             Use --self-test to exercise the engine on this platform.",
+            std::env::consts::OS
+        )))
+    }
+}
+
+fn describe_source(config: &AppConfig) -> String {
+    config.source.as_ref().map_or_else(
+        || "built-in defaults".to_string(),
+        |path| path.display().to_string(),
+    )
+}
+
+/// Set up logging. `RUST_LOG` always wins, so an operator can turn the noise up
+/// or down without restarting with different flags.
+fn init_logging(verbose: bool) {
+    let default = if verbose { "debug" } else { "info" };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default)).init();
 }
