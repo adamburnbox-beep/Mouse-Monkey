@@ -140,3 +140,38 @@ BANANA2 = parse("""
 |..yyyyyyY.|
 |...YYYYY..|
 """)
+
+KEYBOARD = parse("""
+|GGGGGGGGGGGGGGGG|
+|GxxGxxGxxGxxGxxG|
+|GxGxxGxxGxxGxxGG|
+|GGGxxxxxxxxxxGGG|
+|GGGGGGGGGGGGGGGG|
+""")
+
+TYPE_ARM_L = parse("""
+|.L|
+|LF|
+|LF|
+|FD|
+""")
+TYPE_ARM_R = parse("""
+|F.|
+|FD|
+|FD|
+|FD|
+""")
+PAW = parse("""
+|hk|
+|ks|
+""")
+
+PUFF = parse("""
+|.xx.|
+|xxxx|
+|.xx.|
+""")
+PUFF_S = parse("""
+|xx|
+|xx|
+""")

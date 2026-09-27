@@ -137,10 +137,12 @@ def draw_face(c, hx, hy, pose):
     ex, ey = pose.get('eye_shift', (0, 0))
     fx, fy = hx + 2 + fdx, hy + 3 + fdy
     head_px = {(x, y) for y in range(32) for x in range(32) if c.get(x, y) not in (None, 'O', 'I')}
+    flush = pose.get('flush', 0)
+    red = {'k': 'K', 'h': 'H', 's': 'S'} if flush >= 2 else {}
     for j, r in enumerate(FACE):
         for i, ch in enumerate(r):
             if ch != '.' and (fx + i, fy + j) in head_px:
-                c.set(fx + i, fy + j, ch)
+                c.set(fx + i, fy + j, red.get(ch, ch))
 
     eyes = pose.get('eyes', 'open')
     ex0, ey0 = fx + 3 + ex, fy + 2 + ey
@@ -200,10 +202,14 @@ def draw_face(c, hx, hy, pose):
             c.set(fx + x, fy + y + ey, 'e')
             c.set(fx + 13 - x, fy + y + ey, 'e')
 
-    if pose.get('blush', True):
+    if pose.get('blush', True) or flush:
         for x in (1, 2):
             c.set(fx + x, fy + 5, 'p')
             c.set(fx + x + 10, fy + 5, 'p')
+        if flush:
+            for x in (1, 2, 3):
+                c.set(fx + x, fy + 6, 'p')
+                c.set(fx + x + 9, fy + 6, 'p')
 
     # nose
     c.set(fx + 6, fy + 5, 'n')
@@ -276,4 +282,11 @@ def draw_monkey(pose):
 
     for fx in pose.get('fx', []):
         fx(c, hx, hy)
-    return c.image()
+    im = c.image()
+    hop = pose.get('hop', 0)
+    if hop:
+        shifted = im.crop((0, 0, im.width, im.height))
+        shifted.paste((0, 0, 0, 0), (0, 0, im.width, im.height))
+        shifted.paste(im.crop((0, hop, im.width, im.height)), (0, 0))
+        im = shifted
+    return im

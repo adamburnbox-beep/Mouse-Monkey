@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use crate::config::AppConfig;
-use crate::platform::{InputEvent, MouseButton, PlatformDriver, Rect};
+use crate::platform::{InputEvent, KeyKind, MouseButton, PlatformDriver, Rect};
 use crate::sprite_renderer::SpriteData;
 use log::info;
 use std::io;
@@ -181,7 +181,13 @@ impl WaylandDriver {
                         if ev.event_type() == EventType::KEY {
                             let key_code = ev.code() as u32;
                             if ev.value() == 1 {
-                                let _ = sender.send(InputEvent::KeyDown { key_code });
+                                let kind = match evdev::Key(ev.code()) {
+                                    evdev::Key::KEY_SPACE
+                                    | evdev::Key::KEY_ENTER
+                                    | evdev::Key::KEY_KPENTER => KeyKind::Thump,
+                                    _ => KeyKind::Other,
+                                };
+                                let _ = sender.send(InputEvent::KeyDown { key_code, kind });
                             } else if ev.value() == 0 {
                                 let _ = sender.send(InputEvent::KeyUp { key_code });
                             }
@@ -215,18 +221,26 @@ impl WaylandDriver {
                         Ok(events) => {
                             let mut dx = 0i32;
                             let mut dy = 0i32;
+                            let mut wheel = 0i32;
                             for ev in events {
                                 if ev.event_type() == EventType::RELATIVE {
                                     match RelativeAxisType(ev.code()) {
                                         RelativeAxisType::REL_X => dx += ev.value(),
                                         RelativeAxisType::REL_Y => dy += ev.value(),
+                                        RelativeAxisType::REL_WHEEL => wheel += ev.value(),
                                         _ => {}
                                     }
                                 }
                             }
+                            if wheel != 0 {
+                                // evdev reports wheel-up as positive; we use positive = down.
+                                ws.lock().unwrap().pending_events.push(InputEvent::Scroll {
+                                    delta: -wheel as f32,
+                                });
+                            }
                             if dx != 0 || dy != 0 {
                                 let mut s = ws.lock().unwrap();
-                                
+
                                 // Use current global position as base
                                 let (mut cx, mut cy) = s.global_cursor_pos;
 
@@ -875,7 +889,20 @@ impl PointerHandler for WaylandDriverState {
                         button: mouse_button,
                     });
                 }
-                _ => {}
+                PointerEventKind::Axis { vertical, .. } => {
+                    // With evdev active the wheel is already read globally.
+                    if !s.evdev_active {
+                        let delta = if vertical.discrete != 0 {
+                            vertical.discrete as f32
+                        } else {
+                            // ~10 px of continuous scroll per wheel notch
+                            (vertical.absolute / 10.0) as f32
+                        };
+                        if delta != 0.0 {
+                            s.pending_events.push(InputEvent::Scroll { delta });
+                        }
+                    }
+                }
             }
         }
     }

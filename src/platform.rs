@@ -11,15 +11,25 @@ pub enum InputEvent {
     MouseDown { x: f32, y: f32, button: MouseButton },
     /// Mouse button released.
     MouseUp { x: f32, y: f32, button: MouseButton },
-    /// Keyboard key pressed.
-    KeyDown { key_code: u32 }, // Using u32 as a generic placeholder for key codes
+    /// Keyboard key pressed. `key_code` is platform-specific; `kind` is the
+    /// platform-neutral classification the monkey reacts to.
+    KeyDown { key_code: u32, kind: KeyKind },
     /// Keyboard key released.
     KeyUp { key_code: u32 },   // Using u32 as a generic placeholder for key codes
+    /// Mouse wheel scrolled. `delta` is in wheel notches, positive = down.
+    Scroll { delta: f32 },
     /// Window close requested.
     CloseRequested,
     /// Window resized.
     WindowResized { width: u32, height: u32 },
-    // Add other events as needed, e.g., mouse scroll, character input
+}
+
+/// Keys that get a distinct typing animation.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum KeyKind {
+    /// Space bar or Enter: both paws thump the keyboard.
+    Thump,
+    Other,
 }
 
 /// Represents a mouse button.

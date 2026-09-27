@@ -1,7 +1,7 @@
 #![cfg(target_os = "windows")]
 
 use crate::config::AppConfig;
-use crate::platform::{InputEvent, MouseButton, PlatformDriver, Rect};
+use crate::platform::{InputEvent, KeyKind, MouseButton, PlatformDriver, Rect};
 use crate::sprite_renderer::SpriteData;
 use log::{error, info, warn};
 use std::io::{self, Write};
@@ -22,7 +22,7 @@ use windows::{
         UI::{
             Input::KeyboardAndMouse::{
                 SetWindowsHookExW, UnhookWindowsHookEx, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT,
-                WH_KEYBOARD_LL, WH_MOUSE_LL, HHOOK,
+                WH_KEYBOARD_LL, WH_MOUSE_LL, HHOOK, VK_RETURN, VK_SPACE,
             },
             WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
@@ -30,7 +30,8 @@ use windows::{
                 SetWindowPos, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, MSG,
                 SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WM_CLOSE, WM_CREATE,
                 WM_DISPLAYCHANGE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-                WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_QUIT, WNDCLASSEXW, WS_EX_LAYERED,
+                WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_QUIT, WNDCLASSEXW,
+                WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WS_EX_LAYERED,
                 WS_EX_TRANSPARENT, WS_POPUP, PeekMessageW, PM_REMOVE,
             },
         },
@@ -58,6 +59,11 @@ unsafe extern "system" fn mouse_hook_proc(n_code: i32, w_param: WPARAM, l_param:
             WM_RBUTTONUP => Some(InputEvent::MouseUp { x, y, button: MouseButton::Right }),
             WM_MBUTTONDOWN => Some(InputEvent::MouseDown { x, y, button: MouseButton::Middle }),
             WM_MBUTTONUP => Some(InputEvent::MouseUp { x, y, button: MouseButton::Middle }),
+            WM_MOUSEWHEEL => {
+                // High word of mouseData is the signed wheel delta (120 per notch, positive = up).
+                let wheel = (mouse_struct.mouseData >> 16) as u16 as i16;
+                Some(InputEvent::Scroll { delta: -(wheel as f32) / 120.0 })
+            }
             _ => None,
         };
 
@@ -76,8 +82,14 @@ unsafe extern "system" fn keyboard_hook_proc(n_code: i32, w_param: WPARAM, l_par
         let kbd_struct = *(l_param.0 as *const KBDLLHOOKSTRUCT);
         let key_code = kbd_struct.vkCode; // Virtual key code
 
+        let kind = if key_code == VK_SPACE.0 as u32 || key_code == VK_RETURN.0 as u32 {
+            KeyKind::Thump
+        } else {
+            KeyKind::Other
+        };
+
         let event = match w_param.0 as u32 {
-            WM_KEYDOWN | WM_SYSKEYDOWN => Some(InputEvent::KeyDown { key_code }),
+            WM_KEYDOWN | WM_SYSKEYDOWN => Some(InputEvent::KeyDown { key_code, kind }),
             WM_KEYUP | WM_SYSKEYUP => Some(InputEvent::KeyUp { key_code }),
             _ => None,
         };

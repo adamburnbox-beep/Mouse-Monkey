@@ -32,7 +32,10 @@ PAL = {
     'u': (91, 158, 166),   # mug
     'U': (60, 110, 122),   # mug dark
     'v': (70, 42, 30),     # coffee
-    'x': (236, 236, 244),  # steam / motion line
+    'x': (236, 236, 244),  # steam / keycaps
+    'K': (240, 142, 118),  # overheated skin
+    'H': (250, 178, 150),  # overheated skin light
+    'S': (214, 102, 88),   # overheated skin shadow
 }
 
 
