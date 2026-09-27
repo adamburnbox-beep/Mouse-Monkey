@@ -63,6 +63,8 @@ const MICRO_WIGGLE_INTERVAL_FRAMES: u64 = 500;
 const MICRO_WIGGLE_DURATION_S: f32 = 0.4;
 const MICRO_WIGGLE_AMPLITUDE_PX: f32 = 2.0;
 const GRAVITY_PX_PER_S_SQUARED: f32 = 9.8 * 60.0;
+/// Fraction of speed kept when a thrown monkey bounces off a wall or the ceiling.
+const WALL_BOUNCE: f32 = 0.45;
 
 // Mochi jelly: a damped spring drives vertical stretch; horizontal squish
 // is half of it to preserve volume (k_squish = 0.5 * k_stretch).
@@ -389,6 +391,7 @@ impl Monkey {
         self.paw_until = now + PAW_DOWN_S;
         if !matches!(self.state, PetState::Dragged | PetState::Dramatic | PetState::Typing) {
             self.transition_to(PetState::Typing);
+            info!("Monkey: typing along.");
         }
     }
 
@@ -501,7 +504,12 @@ impl Monkey {
                 }
             }
             PetState::Hunting => {
-                let (target_x, target_y) = platform_driver.get_cursor_pos();
+                // Aim for the cursor, but only as far as the monkey can fully
+                // fit on screen; otherwise it would walk into an edge forever.
+                let (target_x, target_y) = self.reachable_target(
+                    platform_driver.get_cursor_pos(),
+                    &platform_driver.get_screen_bounds(),
+                );
                 let (monkey_cx, monkey_cy) = self.center();
                 let dx = target_x - monkey_cx;
                 let dy = target_y - monkey_cy;
@@ -606,17 +614,29 @@ impl Monkey {
                 self.current_animation_row = ROW_HELD;
                 self.current_animation_frame_index = 1 + (t * 10.0) as u32 % 7;
 
-                let floor_y = platform_driver
-                    .get_screen_bounds()
-                    .iter()
-                    .filter(|r| {
-                        self.position.0 < (r.x + r.width as i32) as f32
-                            && self.position.0 + self.sprite_width as f32 > r.x as f32
-                    })
-                    .map(|r| (r.y + r.height as i32) as f32 - self.sprite_height as f32)
-                    .fold(f32::MAX, f32::min);
-                if self.position.1 >= floor_y {
-                    self.position.1 = floor_y;
+                let screens = platform_driver.get_screen_bounds();
+                let Some(screen) = Self::screen_under(&screens, self.center().0) else {
+                    // No screen information at all: stop falling rather than vanish.
+                    self.velocity = (0.0, 0.0);
+                    self.transition_to(PetState::Idle);
+                    return;
+                };
+                let (w, h) = (self.sprite_width as f32, self.sprite_height as f32);
+                let left = screen.x as f32;
+                let right = (screen.x + screen.width as i32) as f32 - w;
+                let top = screen.y as f32;
+                let floor = (screen.y + screen.height as i32) as f32 - h;
+
+                if self.position.0 < left || self.position.0 > right {
+                    self.position.0 = self.position.0.clamp(left, right.max(left));
+                    self.velocity.0 = -self.velocity.0 * WALL_BOUNCE;
+                }
+                if self.position.1 < top && self.velocity.1 < 0.0 {
+                    self.position.1 = top;
+                    self.velocity.1 = -self.velocity.1 * WALL_BOUNCE;
+                }
+                if self.position.1 >= floor {
+                    self.position.1 = floor;
                     self.velocity = (0.0, 0.0);
                     self.jelly_velocity -= 5.0;
                     self.transition_to(PetState::Idle);
@@ -624,6 +644,26 @@ impl Monkey {
                 }
             }
         }
+    }
+
+    /// The screen containing x, or the horizontally nearest one.
+    fn screen_under(screens: &[Rect], x: f32) -> Option<Rect> {
+        let dist = |r: &Rect| {
+            let (l, r) = (r.x as f32, (r.x + r.width as i32) as f32);
+            if x < l { l - x } else if x >= r { x - r } else { 0.0 }
+        };
+        screens.iter().copied().min_by(|a, b| dist(a).total_cmp(&dist(b)))
+    }
+
+    fn reachable_target(&self, (x, y): (f32, f32), screens: &[Rect]) -> (f32, f32) {
+        let Some(screen) = Self::screen_under(screens, x) else {
+            return (x, y);
+        };
+        let (hw, hh) = (self.sprite_width as f32 / 2.0, self.sprite_height as f32 / 2.0);
+        let (l, t) = (screen.x as f32 + hw, screen.y as f32 + hh);
+        let r = (screen.x + screen.width as i32) as f32 - hw;
+        let b = (screen.y + screen.height as i32) as f32 - hh;
+        (x.clamp(l, r.max(l)), y.clamp(t, b.max(t)))
     }
 
     fn update_jelly(&mut self, dt: f32) {
@@ -690,11 +730,12 @@ mod tests {
 
     struct MockDriver {
         cursor: Cell<(f32, f32)>,
+        screens: Vec<Rect>,
     }
 
     impl PlatformDriver for MockDriver {
         fn new(_config: &AppConfig) -> io::Result<Self> {
-            Ok(Self { cursor: Cell::new((0.0, 0.0)) })
+            Ok(Self { cursor: Cell::new((0.0, 0.0)), screens: Vec::new() })
         }
         fn create_window(&mut self, _: u32, _: u32, _: &str) -> io::Result<()> {
             Ok(())
@@ -706,7 +747,7 @@ mod tests {
             Ok(())
         }
         fn get_screen_bounds(&self) -> Vec<Rect> {
-            vec![Rect { x: 0, y: 0, width: 1920, height: 1080 }]
+            self.screens.clone()
         }
         fn set_window_position(&mut self, _: i32, _: i32) {}
         fn set_window_size(&mut self, _: u32, _: u32) {}
@@ -721,7 +762,10 @@ mod tests {
 
     /// Monkey at (500, 500), cursor parked just below it.
     fn setup() -> (Monkey, MockDriver) {
-        let driver = MockDriver { cursor: Cell::new((564.0, 700.0)) };
+        let driver = MockDriver {
+            cursor: Cell::new((564.0, 700.0)),
+            screens: vec![Rect { x: 0, y: 0, width: 1920, height: 1080 }],
+        };
         let mut m = Monkey::new((500.0, 500.0), 128, 128);
         m.tick(&[], DT, &driver);
         (m, driver)
@@ -928,5 +972,85 @@ mod tests {
         step(&mut m, &d, &[InputEvent::Scroll { delta: 3.0 }]);
         step(&mut m, &d, &[key(KeyKind::Other)]);
         assert_eq!(m.state, PetState::Typing);
+    }
+
+    fn fling(m: &mut Monkey, d: &MockDriver, from: (f32, f32), step_px: (f32, f32)) {
+        step(m, d, &[InputEvent::MouseDown { x: from.0, y: from.1, button: MouseButton::Left }]);
+        let mut p = from;
+        for _ in 0..8 {
+            p = (p.0 + step_px.0, p.1 + step_px.1);
+            step(m, d, &[mv(p.0, p.1)]);
+        }
+        step(m, d, &[InputEvent::MouseUp { x: p.0, y: p.1, button: MouseButton::Left }]);
+    }
+
+    fn assert_on_floor_and_visible(m: &Monkey) {
+        assert_eq!(m.state, PetState::Idle, "landed");
+        assert!((m.position.1 - (1080.0 - 128.0)).abs() < 0.5, "on the floor: {:?}", m.position);
+        assert!(m.position.0 >= 0.0 && m.position.0 <= 1920.0 - 128.0, "on screen: {:?}", m.position);
+    }
+
+    #[test]
+    fn thrown_into_a_wall_bounces_and_lands_on_the_floor() {
+        let (mut m, d) = setup();
+        fling(&mut m, &d, (560.0, 560.0), (60.0, -5.0));
+        assert_eq!(m.state, PetState::Dramatic);
+        let mut bounced = false;
+        for _ in 0..(6.0 / DT) as u32 {
+            step(&mut m, &d, &[]);
+            bounced |= m.velocity.0 < 0.0;
+            if m.state != PetState::Dramatic {
+                break;
+            }
+        }
+        assert!(bounced, "bounced off the right wall");
+        assert_on_floor_and_visible(&m);
+    }
+
+    #[test]
+    fn thrown_at_the_ceiling_bounces_down_quickly() {
+        let (mut m, d) = setup();
+        fling(&mut m, &d, (560.0, 560.0), (0.0, -60.0));
+        assert_eq!(m.state, PetState::Dramatic);
+        idle_for(&mut m, &d, 3.0);
+        assert_on_floor_and_visible(&m);
+    }
+
+    #[test]
+    fn dropped_off_screen_is_brought_back() {
+        let (mut m, d) = setup();
+        step(&mut m, &d, &[InputEvent::MouseDown { x: 560.0, y: 560.0, button: MouseButton::Left }]);
+        for i in 1..=100 {
+            step(&mut m, &d, &[mv(560.0 + i as f32 * 25.0, 560.0 + i as f32 * 20.0)]);
+        }
+        for _ in 0..30 {
+            step(&mut m, &d, &[]);
+        }
+        step(&mut m, &d, &[InputEvent::MouseUp { x: 3060.0, y: 2560.0, button: MouseButton::Left }]);
+        idle_for(&mut m, &d, 0.5);
+        assert!(m.position.0 >= 0.0 && m.position.0 <= 1920.0 - 128.0, "{:?}", m.position);
+        assert!(m.position.1 >= 0.0 && m.position.1 <= 1080.0 - 128.0, "{:?}", m.position);
+    }
+
+    #[test]
+    fn thrown_with_no_screen_info_stops_instead_of_falling_forever() {
+        let (mut m, mut d) = setup();
+        d.screens.clear();
+        fling(&mut m, &d, (560.0, 560.0), (60.0, 0.0));
+        idle_for(&mut m, &d, 0.2);
+        assert_ne!(m.state, PetState::Dramatic);
+    }
+
+    #[test]
+    fn chasing_a_cursor_in_the_corner_ends_at_the_screen_edge() {
+        let (mut m, d) = setup();
+        for i in 0..20 {
+            step(&mut m, &d, &[mv(600.0 + i as f32 * 66.0, 600.0 - i as f32 * 30.0)]);
+        }
+        assert_eq!(m.state, PetState::Hunting);
+        d.cursor.set((1919.0, 0.0));
+        idle_for(&mut m, &d, 3.0);
+        assert_ne!(m.state, PetState::Hunting, "reached the corner");
+        assert!((m.position.0 - (1920.0 - 128.0)).abs() < 1.0 && m.position.1.abs() < 1.0, "{:?}", m.position);
     }
 }

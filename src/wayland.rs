@@ -82,12 +82,19 @@ pub struct WaylandDriverState {
 }
 
 impl WaylandDriver {
-    /// Spawns evdev reader threads for keyboard and ALL mouse devices found.
+    /// Spawns evdev reader threads for ALL keyboard and mouse devices found.
     ///
-    /// **Device classification** (critical):
-    /// - Real keyboard: supports KEY events AND has KEY_A (excludes mice that
+    /// **Device classification**:
+    /// - Keyboard: supports KEY events AND has KEY_A (excludes mice that
     ///   report BTN_LEFT as a KEY event).
     /// - Mouse: supports REL_X + REL_Y relative-axis events.
+    /// A combo device (e.g. keyboard with a trackpoint) is opened twice, once
+    /// per role.
+    ///
+    /// Every keyboard gets its own reader: a system often has several nodes
+    /// with letter keys (laptop keyboard, external keyboard, extra USB
+    /// interfaces, remapper virtual devices such as keyd), and there's no
+    /// reliable way to tell which one the user types on.
     ///
     /// **Cursor tracking**: Each mouse device gets its own accumulator thread
     /// that reads REL_X/REL_Y deltas and emits MouseMove to `pending_events`.
@@ -95,14 +102,14 @@ impl WaylandDriver {
     /// `poll_events` drains both the channel (keyboard) and pending_events.
     ///
     /// **Permissions**: Requires the process user to be in the `input` group
-    /// (`sudo usermod -aG input $USER`, then re-login). If the device cannot
-    /// be opened, a warning is logged and that device is skipped.
+    /// (`sudo usermod -aG input $USER`, then log out and back in).
     fn setup_evdev_input(
         event_sender: crossbeam_channel::Sender<InputEvent>,
         wayland_state: Arc<Mutex<WaylandState>>,
     ) -> (Vec<thread::JoinHandle<()>>, bool) {
         let mut key_devices: Vec<Device> = Vec::new();
         let mut mouse_devices: Vec<Device> = Vec::new();
+        let mut permission_denied = 0usize;
 
         if let Ok(entries) = std::fs::read_dir("/dev/input") {
             let mut paths: Vec<_> = entries
@@ -110,91 +117,126 @@ impl WaylandDriver {
                 .map(|e| e.path())
                 .filter(|p| {
                     p.file_name()
-                            .and_then(|n| n.to_str())
-                            .map_or(false, |s| s.starts_with("event"))
+                        .and_then(|n| n.to_str())
+                        .map_or(false, |s| s.starts_with("event"))
                 })
                 .collect();
             paths.sort();
 
             for path in &paths {
-                match Device::open(path) {
+                let dev = match Device::open(path) {
+                    Ok(dev) => dev,
                     Err(e) => {
-                        // Likely EACCES — user not in `input` group.
-                        log::debug!("evdev: cannot open {:?}: {} (hint: add user to `input` group)", path, e);
+                        if e.kind() == io::ErrorKind::PermissionDenied {
+                            permission_denied += 1;
+                        }
+                        log::debug!("evdev: cannot open {:?}: {}", path, e);
+                        continue;
                     }
-                    Ok(dev) => {
-                        // A real keyboard has letter keys (KEY_A).  Mice and
-                        // other HID devices often report EventType::KEY for
-                        // buttons (BTN_LEFT etc.) but NOT KEY_A.
-                        let is_keyboard = dev.supported_events().contains(EventType::KEY)
-                            && dev
-                                .supported_keys()
-                                .map_or(false, |keys| keys.contains(evdev::Key::KEY_A));
+                };
+                let name = dev.name().unwrap_or("?").to_string();
+                let is_keyboard = dev.supported_events().contains(EventType::KEY)
+                    && dev
+                        .supported_keys()
+                        .map_or(false, |keys| keys.contains(evdev::Key::KEY_A));
+                let is_mouse = dev.supported_relative_axes().map_or(false, |axes| {
+                    axes.contains(RelativeAxisType::REL_X) && axes.contains(RelativeAxisType::REL_Y)
+                });
 
-                        // A mouse/touchpad has X+Y relative axes.
-                        let is_mouse = dev
-                            .supported_relative_axes()
-                            .map_or(false, |axes| {
-                                axes.contains(RelativeAxisType::REL_X)
-                                    && axes.contains(RelativeAxisType::REL_Y)
-                            });
-
-                        if is_keyboard {
-                            log::info!("evdev: keyboard device {:?} ({})", path, dev.name().unwrap_or("?"));
-                            key_devices.push(dev);
-                        } else if is_mouse {
-                            // Re-open so keyboard and mouse threads each hold
-                            // their own file descriptor for the same device if
-                            // it happens to be classified as both (rare).
-                            log::info!("evdev: mouse device {:?} ({})", path, dev.name().unwrap_or("?"));
-                            mouse_devices.push(dev);
+                if is_keyboard {
+                    log::info!("evdev: keyboard device {:?} ({})", path, name);
+                    key_devices.push(dev);
+                    if is_mouse {
+                        match Device::open(path) {
+                            Ok(second) => {
+                                log::info!("evdev: mouse device {:?} ({})", path, name);
+                                mouse_devices.push(second);
+                            }
+                            Err(e) => log::debug!("evdev: cannot reopen {:?}: {}", path, e),
                         }
                     }
+                } else if is_mouse {
+                    log::info!("evdev: mouse device {:?} ({})", path, name);
+                    mouse_devices.push(dev);
                 }
             }
         }
 
-        if key_devices.is_empty() {
-            let msg = "evdev: no keyboard found — keyboard scratch will not work. Is user in `input` group?";
-            log::warn!("{}", msg);
-            eprintln!("Warning (WaylandDriver): {}", msg);
-        }
-        if mouse_devices.is_empty() {
-            let msg = "evdev: no mouse found — global cursor tracking disabled. Is user in `input` group?";
+        if key_devices.is_empty() || mouse_devices.is_empty() {
+            let msg = if permission_denied > 0 {
+                format!(
+                    "evdev: permission denied on {} input device(s), so typing, scrolling and \
+                     global cursor tracking are disabled. Fix: `sudo usermod -aG input $USER`, \
+                     then log out and back in (check with `id -nG | grep input`).",
+                    permission_denied
+                )
+            } else if key_devices.is_empty() {
+                "evdev: no keyboard device found; typing reactions are disabled.".to_string()
+            } else {
+                "evdev: no mouse device found; global cursor tracking and scrolling are disabled.".to_string()
+            };
             log::warn!("{}", msg);
             eprintln!("Warning (WaylandDriver): {}", msg);
         }
 
         let mut handles = Vec::new();
 
-        // ── Keyboard thread ────────────────────────────────────────────────────
-        // Only needs ONE keyboard device; take the first real keyboard found.
-        if let Some(mut dev) = key_devices.into_iter().next() {
+        // ── Keyboard threads (one per device) ──────────────────────────────────
+        // Some keyboards report the same press on two interfaces; drop a repeat
+        // of the same key from another device within a few milliseconds.
+        let last_press: Arc<Mutex<Option<(u16, std::time::Instant)>>> = Arc::new(Mutex::new(None));
+        for mut dev in key_devices {
             let sender = event_sender.clone();
             let ws = Arc::clone(&wayland_state);
-            handles.push(thread::spawn(move || loop {
-                if !ws.lock().unwrap().running {
-                    break;
-                }
-                if let Ok(events) = dev.fetch_events() {
-                    for ev in events {
-                        if ev.event_type() == EventType::KEY {
-                            let key_code = ev.code() as u32;
-                            if ev.value() == 1 {
-                                let kind = match evdev::Key(ev.code()) {
-                                    evdev::Key::KEY_SPACE
-                                    | evdev::Key::KEY_ENTER
-                                    | evdev::Key::KEY_KPENTER => KeyKind::Thump,
-                                    _ => KeyKind::Other,
-                                };
-                                let _ = sender.send(InputEvent::KeyDown { key_code, kind });
-                            } else if ev.value() == 0 {
-                                let _ = sender.send(InputEvent::KeyUp { key_code });
+            let last_press = Arc::clone(&last_press);
+            handles.push(thread::spawn(move || {
+                let name = dev.name().unwrap_or("?").to_string();
+                let mut announced = false;
+                loop {
+                    if !ws.lock().unwrap().running {
+                        break;
+                    }
+                    match dev.fetch_events() {
+                        Err(e) => {
+                            log::warn!("evdev: keyboard {} read error: {}", name, e);
+                            thread::sleep(Duration::from_millis(500));
+                        }
+                        Ok(events) => {
+                            for ev in events {
+                                if ev.event_type() != EventType::KEY {
+                                    continue;
+                                }
+                                let key_code = ev.code() as u32;
+                                if ev.value() == 1 {
+                                    {
+                                        let mut last = last_press.lock().unwrap();
+                                        let now = std::time::Instant::now();
+                                        if let Some((code, at)) = *last {
+                                            if code == ev.code() && now.duration_since(at) < Duration::from_millis(15) {
+                                                continue;
+                                            }
+                                        }
+                                        *last = Some((ev.code(), now));
+                                    }
+                                    if !announced {
+                                        log::info!("evdev: receiving key presses from {}", name);
+                                        announced = true;
+                                    }
+                                    let kind = match evdev::Key(ev.code()) {
+                                        evdev::Key::KEY_SPACE
+                                        | evdev::Key::KEY_ENTER
+                                        | evdev::Key::KEY_KPENTER => KeyKind::Thump,
+                                        _ => KeyKind::Other,
+                                    };
+                                    let _ = sender.send(InputEvent::KeyDown { key_code, kind });
+                                } else if ev.value() == 0 {
+                                    let _ = sender.send(InputEvent::KeyUp { key_code });
+                                }
                             }
                         }
                     }
+                    thread::sleep(Duration::from_millis(5));
                 }
-                thread::sleep(Duration::from_millis(5));
             }));
         }
 
@@ -244,27 +286,12 @@ impl WaylandDriver {
                                 // Use current global position as base
                                 let (mut cx, mut cy) = s.global_cursor_pos;
 
-                                // Calculate bounds from known outputs.
-                                // Default to current window size if no outputs are registered yet.
-                                // Default to a massive range so the cursor isn't trapped at 0,0 
-                                // while waiting for Wayland output globals to bind.
-                                let mut min_x = -10000.0f32;
-                                let mut min_y = -10000.0f32;
-                                let mut max_x = 10000.0f32;
-                                let mut max_y = 10000.0f32;
-
-                                if !s.outputs.is_empty() {
-                                    min_x = f32::INFINITY;
-                                    min_y = f32::INFINITY;
-                                    max_x = f32::NEG_INFINITY;
-                                    max_y = f32::NEG_INFINITY;
-                                    for r in &s.outputs {
-                                        min_x = min_x.min(r.x as f32);
-                                        min_y = min_y.min(r.y as f32);
-                                        max_x = max_x.max((r.x + r.width as i32) as f32);
-                                        max_y = max_y.max((r.y + r.height as i32) as f32);
-                                    }
-                                }
+                                // Cursor coordinates are surface-local (they are
+                                // recalibrated from Wayland pointer events), so
+                                // keep them within our overlay surface.
+                                let (min_x, min_y) = (0.0f32, 0.0f32);
+                                let max_x = s.window_size.0 as f32;
+                                let max_y = s.window_size.1 as f32;
 
                                 cx = (cx + dx as f32).clamp(min_x, max_x - 1.0);
                                 cy = (cy + dy as f32).clamp(min_y, max_y - 1.0);
@@ -610,8 +637,14 @@ impl PlatformDriver for WaylandDriver {
         Ok(())
     }
 
+    /// The monkey lives in our layer surface's coordinate space: the surface
+    /// covers exactly one output and every pointer position we receive is
+    /// surface-local. Using the compositor's global output layout here would
+    /// put the floor and walls somewhere the surface can't draw (e.g. on a
+    /// second monitor, or anywhere before output info arrives).
     fn get_screen_bounds(&self) -> Vec<Rect> {
-        self.wayland_state.lock().unwrap().outputs.clone()
+        let (width, height) = self.wayland_state.lock().unwrap().window_size;
+        vec![Rect { x: 0, y: 0, width, height }]
     }
 
     fn set_window_position(&mut self, _x: i32, _y: i32) {}
