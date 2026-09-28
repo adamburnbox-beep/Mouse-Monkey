@@ -218,9 +218,12 @@ impl Monkey {
                     self.last_input_time = current_time;
                 }
                 InputEvent::KeyDown { .. } => {
-                    self.transition_to(PetState::Scratching);
-                    self.scratch_decay_timer = Some(current_time);
-                    info!("Monkey: Transitioned to Scratching state.");
+                    // Typing while holding the monkey shouldn't drop it.
+                    if self.state != PetState::Dragged {
+                        self.transition_to(PetState::Scratching);
+                        self.scratch_decay_timer = Some(current_time);
+                        info!("Monkey: Transitioned to Scratching state.");
+                    }
                     self.last_input_time = current_time;
                 }
                 _ => {}
