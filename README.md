@@ -64,6 +64,38 @@ Windows support is not working yet.
 
 ## Running
 
+### The easy way: an app icon
+
+Run this once from the project folder:
+
+```bash
+./install.sh
+```
+
+It builds the app and adds a **Mouse Monkey** icon to your app menu and your desktop.
+After that:
+
+- **Double-click the icon** (or open it from the app menu) to bring him out.
+- **Open it again** to send him home.
+- Or **right-click the icon** and choose **Send Him Home (Quit)**.
+
+Pin it to your dock or panel for one-click access. It also adds a `mouse-monkey`
+terminal command that does the same thing (`mouse-monkey`, `mouse-monkey stop`).
+
+If you change the code, the icon rebuilds the app the next time you open it (you'll
+get a notification while it builds). Other options:
+
+```bash
+./install.sh --autostart   # also start him when you log in
+./install.sh --uninstall   # remove the icons, the command and autostart
+```
+
+If you move the project folder, run `./install.sh` again. If he doesn't appear, the
+app's output is in `$XDG_RUNTIME_DIR/mouse-monkey.log` (usually
+`/run/user/1000/mouse-monkey.log`).
+
+### From a terminal
+
 From the project folder (the config and sprite paths are relative to it):
 
 ```bash
@@ -131,6 +163,9 @@ and scroll input, covering each interaction above.
 | `src/touchpad.rs` | Turns touchpad finger positions into cursor motion and two-finger scrolling. |
 | `src/platform.rs` | The input events and driver interface shared by all platforms. |
 | `src/sprite_renderer.rs` | Loads and validates the sprite sheet. |
+| `mouse-monkey.sh` | Starts or stops the app, rebuilding it first if the code changed. |
+| `install.sh` | Adds the app menu/desktop icon, the `mouse-monkey` command and optional autostart. |
+| `assets/icon.png` | The app icon (the first frame of the animation sheet, scaled up). |
 | `assets/sprites/` | `monkey_directional.png` (the animation sheet the app uses) and `monkey_brown.png` (a sheet of 16 emotes). |
 | `tools/sprites/` | The pixel art source that generates both sprite sheets. |
 
