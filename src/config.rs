@@ -18,6 +18,10 @@ pub struct AppConfig {
     pub window_height: u32,
     pub window_title: String,
     pub tick_rate_hz: u32,
+    /// When true the monkey ignores all clicks and scrolls, so they always go
+    /// to the window underneath it (the monkey can then not be dragged).
+    #[serde(default)]
+    pub click_through: bool,
     pub sprite: SpriteConfig,
 }
 

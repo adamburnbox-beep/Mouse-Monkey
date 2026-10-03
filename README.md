@@ -34,6 +34,12 @@ Inspired by [Comnyang](https://comnyang.com/en), the desktop cat.
 
 When he's idle he breathes, sways his tail and occasionally does a little wiggle.
 
+He never gets in the way of your other windows: he only watches your input, never
+takes it. Clicks and scrolls anywhere except on his body go straight to the window
+underneath, even right next to him. Set `click_through = true` (see
+[Configuration](#configuration)) if you'd rather he ignored clicks and scrolls on his
+body too.
+
 ## Requirements
 
 - **Linux with Wayland**, and a compositor that supports the layer-shell protocol, e.g.
@@ -50,9 +56,14 @@ When he's idle he breathes, sways his tail and occasionally does a little wiggle
   ```bash
   sudo usermod -aG input $USER
   ```
+  To try it before logging out, start him with `sg input -c 'cargo run --release'`.
   Check it worked with `id -nG | grep input`. Without it he can still be clicked,
-  dragged and petted, but he won't react to typing or scrolling, and he only notices
-  the cursor when it's near him.
+  dragged and petted, and scrolling on him still peels the banana, but he won't react
+  to typing or to scrolling elsewhere, and he only notices the cursor when it's over
+  him.
+
+  He reads every keyboard, mouse and touchpad, including ones connected after he
+  starts (e.g. Bluetooth). On a touchpad, two-finger scrolling counts as scrolling.
 
 Windows support is not working yet.
 
@@ -72,22 +83,22 @@ To see what he's doing and why, turn on logging:
 RUST_LOG=info cargo run --release
 ```
 
-At startup this lists the keyboards and mice found (`evdev: keyboard device …`); the
+At startup this lists the input devices found (`evdev: reading … as keyboard`); the
 first key press prints `evdev: receiving key presses from <device>`, and state changes
 print lines like `Monkey: typing along.`, `Monkey: chasing the cursor.` or
 `Monkey: landed.`
 
 ## Troubleshooting
 
-- **He doesn't react to typing.** Run with `RUST_LOG=info` and look at the startup
-  warnings. A permission-denied warning means the `input` group step above is missing,
-  or you haven't logged out and back in since. If no `receiving key presses` line
-  appears when you type, please open an issue with the `evdev:` lines from the log.
+- **He doesn't react to typing.** Look at the warning printed at startup. A
+  permission-denied warning says what to do: either the `input` group step above is
+  missing, or you haven't logged out and back in since. If no `receiving key presses`
+  line appears with `RUST_LOG=info` when you type, please open an issue with the
+  `evdev:` lines from the log.
+- **An app won't scroll or click where he's sitting.** Input on his body goes to him
+  so you can drag him. Move him aside, or set `click_through = true`.
 - **No monkey appears at all.** Your compositor probably doesn't support layer-shell
   (e.g. GNOME).
-- **`git status` shows lots of changes under `target/`.** The build folder is committed
-  to the repo, so every build modifies it. Those changes are safe to discard with
-  `git checkout -- target`.
 
 ## Configuration
 
@@ -96,9 +107,10 @@ Settings live in `monkey_companion.toml`:
 | Setting | Meaning |
 |---|---|
 | `tick_rate_hz` | Updates per second (default 60). |
+| `click_through` | `true` makes clicks and scrolls on him pass through to the window underneath. He can't be clicked or dragged then; everything else still works through `/dev/input`. Default `false`. |
 | `sprite.sheet_path` | The sprite sheet to load. |
 | `sprite.frame_width`, `sprite.frame_height` | Size of one animation frame on the sheet (128 × 128). |
-| `window_width`, `window_height` | Initial overlay size; the compositor resizes it to fit your screen. |
+| `window_width`, `window_height` | Placeholder overlay size; the overlay always covers the whole screen. |
 
 ## Development
 
