@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use crate::config::AppConfig;
-use crate::platform::{InputEvent, MouseButton, PlatformDriver, Rect};
+use crate::platform::{InputEvent, KeyKind, MouseButton, PlatformDriver, Rect};
 use crate::sprite_renderer::SpriteData;
 use log::info;
 use std::collections::HashSet;
@@ -9,7 +9,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Wayland specific imports for sctk 0.18
 use sctk::{
@@ -42,6 +42,11 @@ const EVDEV_RESCAN_INTERVAL: Duration = Duration::from_secs(2);
 /// Touchpad finger travel → cursor pixels. Roughly libinput's default speed;
 /// any drift is corrected whenever the pointer passes over the monkey.
 const TOUCHPAD_PX_PER_MM: f32 = 12.0;
+/// Two-finger touchpad travel that counts as one mouse-wheel notch.
+const TOUCHPAD_MM_PER_SCROLL_NOTCH: f32 = 6.0;
+/// Some keyboards report one press on two interfaces; a repeat of the same
+/// key from another device within this window is dropped.
+const DUPLICATE_KEY_WINDOW: Duration = Duration::from_millis(15);
 /// Sprite pixels fainter than this don't count as part of the monkey's hitbox.
 const HITBOX_ALPHA_THRESHOLD: u8 = 32;
 /// Opaque pixels are grouped into cells this size (px) so the input region
@@ -69,28 +74,15 @@ struct WaylandState {
 }
 
 impl WaylandState {
-    /// Applies a relative cursor movement measured by evdev, clamped to the
-    /// known monitor layout.
+    /// Applies a relative cursor movement measured by evdev. Cursor
+    /// coordinates are surface-local (they are recalibrated from Wayland
+    /// pointer events), so they're kept within our overlay surface.
     fn move_global_cursor(&mut self, dx: f32, dy: f32) {
-        // Default to a massive range so the cursor isn't trapped at 0,0
-        // while waiting for Wayland output globals to bind.
-        let (mut min_x, mut min_y, mut max_x, mut max_y) = (-10000.0f32, -10000.0f32, 10000.0f32, 10000.0f32);
-        if !self.outputs.is_empty() {
-            min_x = f32::INFINITY;
-            min_y = f32::INFINITY;
-            max_x = f32::NEG_INFINITY;
-            max_y = f32::NEG_INFINITY;
-            for r in &self.outputs {
-                min_x = min_x.min(r.x as f32);
-                min_y = min_y.min(r.y as f32);
-                max_x = max_x.max((r.x + r.width as i32) as f32);
-                max_y = max_y.max((r.y + r.height as i32) as f32);
-            }
-        }
-
+        let max_x = self.window_size.0 as f32;
+        let max_y = self.window_size.1 as f32;
         let (cx, cy) = self.global_cursor_pos;
-        let x = (cx + dx).clamp(min_x, max_x - 1.0);
-        let y = (cy + dy).clamp(min_y, max_y - 1.0);
+        let x = (cx + dx).clamp(0.0, max_x - 1.0);
+        let y = (cy + dy).clamp(0.0, max_y - 1.0);
         self.global_cursor_pos = (x, y);
         if !self.is_dragging {
             self.pending_events.push(InputEvent::MouseMove { x, y });
@@ -230,9 +222,10 @@ fn is_keyboard_key(code: u16) -> bool {
     (1..0x100).contains(&code) || (0x160..0x2c0).contains(&code)
 }
 
-/// Turns absolute touchpad finger positions into relative cursor movement,
-/// the way libinput does: only single-finger contact moves the cursor, so
-/// two-finger scrolling and multi-finger gestures are ignored.
+/// Turns absolute touchpad finger positions into relative cursor movement
+/// the way libinput does: only single-finger contact moves the cursor.
+/// Two-finger vertical movement is reported as scrolling instead; other
+/// multi-finger gestures are ignored.
 #[derive(Default)]
 struct TouchpadTracker {
     touching: bool,
@@ -274,17 +267,30 @@ impl TouchpadTracker {
         }
     }
 
-    /// Called at the end of each event frame; returns the movement in device units.
-    fn on_sync(&mut self) -> (i32, i32) {
-        let (Some(x), Some(y)) = self.pos else { return (0, 0) };
-        if !self.touching || self.tools != 1 {
+    /// Called at the end of each event frame; returns the finger movement in
+    /// device units: `Move` for one finger, `Scroll` for two.
+    fn on_sync(&mut self) -> TouchpadMotion {
+        let (Some(x), Some(y)) = self.pos else { return TouchpadMotion::None };
+        if !self.touching || !(self.tools == 1 || self.tools == 2) {
             self.last = None;
-            return (0, 0);
+            return TouchpadMotion::None;
         }
-        let delta = self.last.map_or((0, 0), |(lx, ly)| (x - lx, y - ly));
+        let delta = self.last.map(|(lx, ly)| (x - lx, y - ly));
         self.last = Some((x, y));
-        delta
+        match delta {
+            None | Some((0, 0)) => TouchpadMotion::None,
+            Some((dx, dy)) if self.tools == 1 => TouchpadMotion::Move(dx, dy),
+            Some((_, dy)) => TouchpadMotion::Scroll(dy),
+        }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TouchpadMotion {
+    None,
+    Move(i32, i32),
+    /// Vertical two-finger movement; positive = fingers moved down.
+    Scroll(i32),
 }
 
 /// Finds input devices and spawns one reader thread per useful device.
@@ -297,6 +303,9 @@ struct EvdevWatcher {
     ignored: HashSet<PathBuf>,
     /// Whether the "can't read input devices" diagnosis was already printed.
     reported_denied: bool,
+    /// Last key press seen on any device, to drop duplicates (see
+    /// DUPLICATE_KEY_WINDOW).
+    last_key_press: Arc<Mutex<Option<(u16, Instant)>>>,
 }
 
 impl EvdevWatcher {
@@ -310,6 +319,7 @@ impl EvdevWatcher {
             tracked: Arc::new(Mutex::new(HashSet::new())),
             ignored: HashSet::new(),
             reported_denied: false,
+            last_key_press: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -377,8 +387,9 @@ impl EvdevWatcher {
             let key_sender = self.key_sender.clone();
             let ws = Arc::clone(&self.wayland_state);
             let tracked = Arc::clone(&self.tracked);
+            let last_key_press = Arc::clone(&self.last_key_press);
             thread::spawn(move || {
-                read_device(dev, caps, &key_sender, &ws);
+                read_device(dev, caps, &key_sender, &ws, &last_key_press);
                 tracked.lock().unwrap().remove(&path);
                 let mut s = ws.lock().unwrap();
                 if caps.keyboard {
@@ -410,7 +421,7 @@ impl EvdevWatcher {
             missing.push("react to typing");
         }
         if pointers == 0 {
-            missing.push("follow the cursor outside its own body");
+            missing.push("notice scrolling or follow the cursor outside its own body");
         }
         let impact = format!("the monkey can't {}.", missing.join(" or "));
 
@@ -433,15 +444,20 @@ impl EvdevWatcher {
     }
 }
 
-/// Reads one device until it disappears, forwarding key presses and cursor
-/// movement to the monkey.
+/// Reads one device until it disappears, forwarding key presses, cursor
+/// movement and scrolling to the monkey.
 fn read_device(
     mut dev: Device,
     caps: DeviceCaps,
     key_sender: &crossbeam_channel::Sender<InputEvent>,
     wayland_state: &Mutex<WaylandState>,
+    last_key_press: &Mutex<Option<(u16, Instant)>>,
 ) {
+    let name = dev.name().unwrap_or("?").to_string();
+    let mut announced_keys = false;
     let mut touchpad = TouchpadTracker::default();
+    // Two-finger travel (device units) not yet turned into whole notches.
+    let mut touchpad_scroll_units = 0.0f32;
     loop {
         let events = match dev.fetch_events() {
             Ok(events) => events,
@@ -453,6 +469,8 @@ fn read_device(
         };
 
         let (mut dx, mut dy) = (0.0f32, 0.0f32);
+        // Wheel notches, positive = down.
+        let mut scroll = 0.0f32;
         for ev in events {
             match ev.event_type() {
                 EventType::KEY => {
@@ -461,7 +479,18 @@ fn read_device(
                         // value 2 = autorepeat, which isn't a new key press.
                         match ev.value() {
                             1 => {
-                                let _ = key_sender.send(InputEvent::KeyDown { key_code });
+                                if is_duplicate_key_press(last_key_press, ev.code()) {
+                                    continue;
+                                }
+                                if !announced_keys {
+                                    info!("evdev: receiving key presses from {}", name);
+                                    announced_keys = true;
+                                }
+                                let kind = match Key(ev.code()) {
+                                    Key::KEY_SPACE | Key::KEY_ENTER | Key::KEY_KPENTER => KeyKind::Thump,
+                                    _ => KeyKind::Other,
+                                };
+                                let _ = key_sender.send(InputEvent::KeyDown { key_code, kind });
                             }
                             0 => {
                                 let _ = key_sender.send(InputEvent::KeyUp { key_code });
@@ -476,24 +505,61 @@ fn read_device(
                 EventType::RELATIVE if caps.mouse => match RelativeAxisType(ev.code()) {
                     RelativeAxisType::REL_X => dx += ev.value() as f32,
                     RelativeAxisType::REL_Y => dy += ev.value() as f32,
+                    // evdev reports wheel-up as positive.
+                    RelativeAxisType::REL_WHEEL => scroll -= ev.value() as f32,
                     _ => {}
                 },
                 EventType::ABSOLUTE if caps.touchpad.is_some() => touchpad.on_abs(ev.code(), ev.value()),
                 EventType::SYNCHRONIZATION => {
                     if let Some((units_x, units_y)) = caps.touchpad {
-                        let (ux, uy) = touchpad.on_sync();
-                        dx += ux as f32 / units_x * TOUCHPAD_PX_PER_MM;
-                        dy += uy as f32 / units_y * TOUCHPAD_PX_PER_MM;
+                        match touchpad.on_sync() {
+                            TouchpadMotion::Move(ux, uy) => {
+                                dx += ux as f32 / units_x * TOUCHPAD_PX_PER_MM;
+                                dy += uy as f32 / units_y * TOUCHPAD_PX_PER_MM;
+                            }
+                            TouchpadMotion::Scroll(uy) => {
+                                // Fingers moving up scroll down (natural scrolling);
+                                // the monkey only cares how much, not which way.
+                                touchpad_scroll_units -= uy as f32;
+                                let notch_units = units_y * TOUCHPAD_MM_PER_SCROLL_NOTCH;
+                                let notches = (touchpad_scroll_units / notch_units).trunc();
+                                if notches != 0.0 {
+                                    scroll += notches;
+                                    touchpad_scroll_units -= notches * notch_units;
+                                }
+                            }
+                            TouchpadMotion::None => {}
+                        }
                     }
                 }
                 _ => {}
             }
         }
 
-        if dx != 0.0 || dy != 0.0 {
-            wayland_state.lock().unwrap().move_global_cursor(dx, dy);
+        if dx != 0.0 || dy != 0.0 || scroll != 0.0 {
+            let mut s = wayland_state.lock().unwrap();
+            if dx != 0.0 || dy != 0.0 {
+                s.move_global_cursor(dx, dy);
+            }
+            if scroll != 0.0 {
+                s.pending_events.push(InputEvent::Scroll { delta: scroll });
+            }
         }
     }
+}
+
+/// Records a key press and reports whether it repeats the previous press
+/// (same key, possibly from another device) within DUPLICATE_KEY_WINDOW.
+fn is_duplicate_key_press(last_key_press: &Mutex<Option<(u16, Instant)>>, code: u16) -> bool {
+    let mut last = last_key_press.lock().unwrap();
+    let now = Instant::now();
+    if let Some((last_code, at)) = *last {
+        if last_code == code && now.duration_since(at) < DUPLICATE_KEY_WINDOW {
+            return true;
+        }
+    }
+    *last = Some((code, now));
+    false
 }
 
 /// Explains why /dev/input/event* can't be opened and what to do about it.
@@ -916,8 +982,14 @@ impl PlatformDriver for WaylandDriver {
         Ok(())
     }
 
+    /// The monkey lives in our layer surface's coordinate space: the surface
+    /// covers exactly one output and every pointer position we receive is
+    /// surface-local. Using the compositor's global output layout here would
+    /// put the floor and walls somewhere the surface can't draw (e.g. on a
+    /// second monitor, or anywhere before output info arrives).
     fn get_screen_bounds(&self) -> Vec<Rect> {
-        self.wayland_state.lock().unwrap().outputs.clone()
+        let (width, height) = self.wayland_state.lock().unwrap().window_size;
+        vec![Rect { x: 0, y: 0, width, height }]
     }
 
     fn set_window_position(&mut self, _x: i32, _y: i32) {}
@@ -1208,7 +1280,21 @@ impl PointerHandler for WaylandDriverState {
                         button: mouse_button,
                     });
                 }
-                _ => {}
+                PointerEventKind::Axis { vertical, .. } => {
+                    // Only reached when scrolling on the monkey itself. With
+                    // evdev the wheel is already read globally.
+                    if s.evdev_pointers == 0 {
+                        let delta = if vertical.discrete != 0 {
+                            vertical.discrete as f32
+                        } else {
+                            // ~10 px of continuous scroll per wheel notch
+                            (vertical.absolute / 10.0) as f32
+                        };
+                        if delta != 0.0 {
+                            s.pending_events.push(InputEvent::Scroll { delta });
+                        }
+                    }
+                }
             }
         }
     }
@@ -1257,8 +1343,15 @@ mod tests {
         assert!(!is_keyboard_key(Key::BTN_TOOL_FINGER.code()));
     }
 
-    /// Feeds one evdev frame (touch state + position) and returns the delta.
+    /// Feeds one evdev frame and returns the one-finger cursor movement.
     fn frame(tp: &mut TouchpadTracker, x: i32, y: i32) -> (i32, i32) {
+        match frame_motion(tp, x, y) {
+            TouchpadMotion::Move(dx, dy) => (dx, dy),
+            _ => (0, 0),
+        }
+    }
+
+    fn frame_motion(tp: &mut TouchpadTracker, x: i32, y: i32) -> TouchpadMotion {
         tp.on_abs(AbsoluteAxisType::ABS_X.0, x);
         tp.on_abs(AbsoluteAxisType::ABS_Y.0, y);
         tp.on_sync()
@@ -1275,17 +1368,19 @@ mod tests {
     }
 
     #[test]
-    fn touchpad_ignores_two_finger_scroll_and_lift() {
+    fn touchpad_two_fingers_scroll_and_lift_does_not_jump() {
         let mut tp = TouchpadTracker::default();
         tp.on_key(Key::BTN_TOUCH.code(), 1);
         tp.on_key(Key::BTN_TOOL_FINGER.code(), 1);
         frame(&mut tp, 100, 100);
 
-        // Second finger lands: two-finger scroll must not move the cursor.
+        // Second finger lands: two-finger movement scrolls instead of moving
+        // the cursor, and the finger-count change itself doesn't count.
         tp.on_key(Key::BTN_TOOL_FINGER.code(), 0);
         tp.on_key(Key::BTN_TOOL_DOUBLETAP.code(), 1);
-        assert_eq!(frame(&mut tp, 100, 300), (0, 0));
-        assert_eq!(frame(&mut tp, 100, 500), (0, 0));
+        assert_eq!(frame_motion(&mut tp, 100, 300), TouchpadMotion::None);
+        assert_eq!(frame_motion(&mut tp, 100, 500), TouchpadMotion::Scroll(200));
+        assert_eq!(frame_motion(&mut tp, 90, 450), TouchpadMotion::Scroll(-50));
 
         // Back to one finger: resumes from the new position without a jump.
         tp.on_key(Key::BTN_TOOL_DOUBLETAP.code(), 0);

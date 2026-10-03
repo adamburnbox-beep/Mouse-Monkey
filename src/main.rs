@@ -47,6 +47,12 @@ fn main() -> io::Result<()> {
         config.sprite.frame_height,
         config.sprite.render_scale,
     );
+    if sprite_sheet.num_frames_y < monkey::SHEET_ROWS || sprite_sheet.num_frames_x < 8 {
+        panic!(
+            "Hard-fail: sprite sheet '{}' has {}x{} frames; expected at least 8x{} (see tools/sprites/build.py).",
+            config.sprite.sheet_path, sprite_sheet.num_frames_x, sprite_sheet.num_frames_y, monkey::SHEET_ROWS
+        );
+    }
 
     // 5. Initialize Monkey
     let initial_monkey_pos = (
@@ -90,7 +96,7 @@ fn main() -> io::Result<()> {
                 sprite_sheet.frame_width,
                 sprite_sheet.frame_height,
             ),
-            position: monkey.position,
+            position: monkey.render_position(),
             scale: monkey.scale,
         };
         platform_driver.render_frame(&sprite_data)?;
