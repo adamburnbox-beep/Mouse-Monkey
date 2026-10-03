@@ -20,7 +20,7 @@ Inspired by [Comnyang](https://comnyang.com/en), the desktop cat.
 | **Stroke his head** (move the cursor side to side over it a few times) | Closes his eyes and purrs, with little hearts floating up. Keeps purring as long as you keep petting. |
 | **Whip the cursor across the screen** | Runs after it. If he catches it he celebrates, then takes a short breather before he'll chase again. |
 | **Leave the mouse alone for 5 minutes** | Wanders over to wherever the cursor is resting. |
-| **Scroll** | Peels a banana a little with every notch of the wheel (about 12 notches), then eats it. Stop scrolling for a few seconds and he puts it away. |
+| **Scroll** (mouse wheel or two fingers on a touchpad) | Peels a banana a little with every notch of the wheel (about 12 notches), then eats it. Stop scrolling for a few seconds and he puts it away. |
 
 ### Keyboard
 
@@ -31,6 +31,9 @@ Inspired by [Comnyang](https://comnyang.com/en), the desktop cat.
 | **Type fast** (about 5+ keys a second) | Gets flushed and starts to sweat. |
 | **Type really fast** (about 8+ keys a second) | Overheats: he turns red, squeezes his eyes shut and steam puffs from his head. He cools down again when you slow down. |
 | **Stop typing** | Goes back to what he was doing after a second and a half. |
+
+All of these work no matter which window is active. He only takes clicks and scrolls
+on his own body; everywhere else they go to the window underneath, as usual.
 
 When he's idle he breathes, sways his tail and occasionally does a little wiggle.
 
@@ -44,15 +47,18 @@ When he's idle he breathes, sways his tail and occasionally does a little wiggle
   ```bash
   sudo apt install pkg-config libxkbcommon-dev libwayland-dev
   ```
-- **Access to input devices.** Wayland doesn't let apps see typing or mouse movement in
-  other windows, so the monkey reads `/dev/input` directly. Add yourself to the `input`
-  group, then **log out and back in** (a new terminal isn't enough):
+- **Access to input devices.** Wayland doesn't let apps see typing, scrolling or mouse
+  movement in other windows, so the monkey reads your keyboard, mouse and touchpad from
+  `/dev/input` directly. Add yourself to the `input` group, then **log out and back in**
+  (a new terminal isn't enough):
   ```bash
   sudo usermod -aG input $USER
   ```
-  Check it worked with `id -nG | grep input`. Without it he can still be clicked,
-  dragged and petted, but he won't react to typing or scrolling, and he only notices
-  the cursor when it's near him.
+  To try it straight away without logging out, start him with
+  `sg input -c "cargo run --release"` instead. Without this access he can still be
+  clicked, dragged and petted, but he won't react to typing or scrolling, and he only
+  notices the cursor while it's over him. He prints which access he has every time he
+  starts.
 
 Windows support is not working yet.
 
@@ -72,17 +78,22 @@ To see what he's doing and why, turn on logging:
 RUST_LOG=info cargo run --release
 ```
 
-At startup this lists the keyboards and mice found (`evdev: keyboard device …`); the
-first key press prints `evdev: receiving key presses from <device>`, and state changes
+At startup this lists every input device and what it's used for
+(`evdev: /dev/input/event3: … (keyboard)`); the first key press prints
+`evdev: receiving key presses from <device>`, and state changes
 print lines like `Monkey: typing along.`, `Monkey: chasing the cursor.` or
 `Monkey: landed.`
 
 ## Troubleshooting
 
-- **He doesn't react to typing.** Run with `RUST_LOG=info` and look at the startup
-  warnings. A permission-denied warning means the `input` group step above is missing,
-  or you haven't logged out and back in since. If no `receiving key presses` line
-  appears when you type, please open an issue with the `evdev:` lines from the log.
+- **He doesn't react to typing or scrolling.** Look at the `Mouse Monkey input access`
+  lines he prints on start; if something says `NOT AVAILABLE`, they tell you how to fix
+  it. To test your devices directly, run:
+  ```bash
+  cargo run --release -- --check-input
+  ```
+  It lists every input device, then listens for 10 seconds while you type, move the
+  mouse or touchpad and scroll, and reports which of those it received.
 - **No monkey appears at all.** Your compositor probably doesn't support layer-shell
   (e.g. GNOME).
 - **`git status` shows lots of changes under `target/`.** The build folder is committed
@@ -116,7 +127,8 @@ and scroll input, covering each interaction above.
 | Path | What's there |
 |---|---|
 | `src/monkey.rs` | The monkey's behaviour: states, timers, physics and which animation frame to show. |
-| `src/wayland.rs` | Linux driver: the transparent overlay, rendering, and reading input from `/dev/input`. |
+| `src/wayland.rs` | Linux driver: the transparent overlay, rendering, reading input from `/dev/input`, and `--check-input`. |
+| `src/touchpad.rs` | Turns touchpad finger positions into cursor motion and two-finger scrolling. |
 | `src/platform.rs` | The input events and driver interface shared by all platforms. |
 | `src/sprite_renderer.rs` | Loads and validates the sprite sheet. |
 | `assets/sprites/` | `monkey_directional.png` (the animation sheet the app uses) and `monkey_brown.png` (a sheet of 16 emotes). |

@@ -3,6 +3,8 @@ mod platform;
 mod sprite_renderer;
 mod state;
 mod monkey;
+#[cfg(target_os = "linux")]
+mod touchpad;
 
 #[cfg(target_os = "linux")]
 mod wayland;
@@ -19,6 +21,12 @@ use log::info;
 
 fn main() -> io::Result<()> {
     env_logger::init();
+
+    #[cfg(target_os = "linux")]
+    if std::env::args().any(|a| a == "--check-input") {
+        wayland::check_input();
+        return Ok(());
+    }
     info!("Starting monkey_companion application...");
 
     // 1. Load configuration

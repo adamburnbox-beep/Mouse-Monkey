@@ -32,7 +32,8 @@ use sctk::{
     shm::{Shm, ShmHandler},
 };
 
-use evdev::{Device, EventType, RelativeAxisType};
+use crate::touchpad::Touchpad;
+use evdev::{AbsoluteAxisType, Device, EventType, PropType, RelativeAxisType};
 
 struct WaylandState {
     running: bool,
@@ -81,103 +82,342 @@ pub struct WaylandDriverState {
     layer_wl_surface: Option<wl_surface::WlSurface>,
 }
 
+// ── Global input via evdev ──────────────────────────────────────────────────
+//
+// Wayland never tells a client about input aimed at other windows, so the only
+// way to react to typing and mouse activity everywhere is to read the kernel's
+// input devices (/dev/input/event*) directly. That needs read access to them,
+// normally by being in the `input` group.
+
+/// Input devices the monkey can read.
+struct InputDevices {
+    keyboards: Vec<Device>,
+    /// Mice and touchpads; touchpads carry a tracker that turns absolute
+    /// finger positions into relative motion and two-finger scrolling.
+    pointers: Vec<(Device, Option<Touchpad>)>,
+    permission_denied: usize,
+    /// One human-readable line per device, for `--check-input`.
+    report: Vec<String>,
+}
+
+fn is_touchpad(dev: &Device) -> bool {
+    let has_xy = dev.supported_absolute_axes().map_or(false, |axes| {
+        axes.contains(AbsoluteAxisType::ABS_X) && axes.contains(AbsoluteAxisType::ABS_Y)
+    });
+    let has_finger = dev
+        .supported_keys()
+        .map_or(false, |keys| keys.contains(evdev::Key::BTN_TOOL_FINGER));
+    // Touchscreens and tablets map directly to the screen; skip those.
+    has_xy && has_finger && !dev.properties().contains(PropType::DIRECT)
+}
+
+fn touchpad_tracker(dev: &Device) -> Touchpad {
+    match dev.get_abs_state() {
+        Ok(abs) => {
+            let x = abs[AbsoluteAxisType::ABS_X.0 as usize];
+            let y = abs[AbsoluteAxisType::ABS_Y.0 as usize];
+            Touchpad::new((x.resolution, y.resolution), (x.maximum - x.minimum, y.maximum - y.minimum))
+        }
+        Err(_) => Touchpad::new((0, 0), (0, 0)),
+    }
+}
+
+fn discover_input_devices() -> InputDevices {
+    let mut found = InputDevices {
+        keyboards: Vec::new(),
+        pointers: Vec::new(),
+        permission_denied: 0,
+        report: Vec::new(),
+    };
+    let mut paths: Vec<_> = match std::fs::read_dir("/dev/input") {
+        Ok(entries) => entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).map_or(false, |s| s.starts_with("event")))
+            .collect(),
+        Err(e) => {
+            found.report.push(format!("cannot list /dev/input: {}", e));
+            return found;
+        }
+    };
+    paths.sort_by_key(|p| {
+        p.to_string_lossy().trim_start_matches("/dev/input/event").parse::<u32>().unwrap_or(u32::MAX)
+    });
+
+    for path in &paths {
+        let dev = match Device::open(path) {
+            Ok(dev) => dev,
+            Err(e) => {
+                if e.kind() == io::ErrorKind::PermissionDenied {
+                    found.permission_denied += 1;
+                }
+                found.report.push(format!("{}: cannot open ({})", path.display(), e));
+                continue;
+            }
+        };
+        let name = dev.name().unwrap_or("?").to_string();
+        let is_keyboard = dev.supported_events().contains(EventType::KEY)
+            && dev.supported_keys().map_or(false, |keys| keys.contains(evdev::Key::KEY_A));
+        let is_mouse = dev.supported_relative_axes().map_or(false, |axes| {
+            axes.contains(RelativeAxisType::REL_X) && axes.contains(RelativeAxisType::REL_Y)
+        });
+        let touchpad = is_touchpad(&dev);
+        let roles: Vec<&str> = [(is_keyboard, "keyboard"), (is_mouse, "mouse"), (touchpad, "touchpad")]
+            .iter()
+            .filter(|(yes, _)| *yes)
+            .map(|(_, role)| *role)
+            .collect();
+        found.report.push(format!(
+            "{}: {} ({})",
+            path.display(),
+            name,
+            if roles.is_empty() { "not used".to_string() } else { roles.join(" + ") }
+        ));
+
+        let pointer = is_mouse || touchpad;
+        let tracker = |d: &Device| if touchpad { Some(touchpad_tracker(d)) } else { None };
+        if is_keyboard {
+            found.keyboards.push(dev);
+            // A combo device gets a second handle for its pointer role.
+            if pointer {
+                if let Ok(second) = Device::open(path) {
+                    let t = tracker(&second);
+                    found.pointers.push((second, t));
+                }
+            }
+        } else if pointer {
+            let t = tracker(&dev);
+            found.pointers.push((dev, t));
+        }
+    }
+    found
+}
+
+fn key_kind(code: u16) -> KeyKind {
+    match evdev::Key(code) {
+        evdev::Key::KEY_SPACE | evdev::Key::KEY_ENTER | evdev::Key::KEY_KPENTER => KeyKind::Thump,
+        _ => KeyKind::Other,
+    }
+}
+
+/// Sums one batch of pointer events into (dx, dy, scroll notches; positive = down).
+fn read_pointer_batch(
+    events: impl Iterator<Item = evdev::InputEvent>,
+    touchpad: &mut Option<Touchpad>,
+) -> (f32, f32, f32) {
+    let (mut dx, mut dy, mut scroll) = (0.0f32, 0.0f32, 0.0f32);
+    for ev in events {
+        match ev.event_type() {
+            EventType::RELATIVE => match RelativeAxisType(ev.code()) {
+                RelativeAxisType::REL_X => dx += ev.value() as f32,
+                RelativeAxisType::REL_Y => dy += ev.value() as f32,
+                // evdev reports wheel-up as positive
+                RelativeAxisType::REL_WHEEL => scroll -= ev.value() as f32,
+                _ => {}
+            },
+            EventType::KEY => {
+                if let Some(t) = touchpad.as_mut() {
+                    t.key(ev.code(), ev.value());
+                }
+            }
+            EventType::ABSOLUTE => {
+                if let Some(t) = touchpad.as_mut() {
+                    t.abs(ev.code(), ev.value());
+                }
+            }
+            EventType::SYNCHRONIZATION => {
+                if let Some(t) = touchpad.as_mut() {
+                    let r = t.sync();
+                    dx += r.dx;
+                    dy += r.dy;
+                    scroll += r.scroll;
+                }
+            }
+            _ => {}
+        }
+    }
+    (dx, dy, scroll)
+}
+
+#[derive(Debug, PartialEq)]
+enum InputGroup {
+    Active,
+    NeedsRelogin,
+    NotMember,
+    Unknown,
+}
+
+fn input_group_status() -> InputGroup {
+    let Ok(group_file) = std::fs::read_to_string("/etc/group") else {
+        return InputGroup::Unknown;
+    };
+    let mut ids = vec![0 as libc::gid_t; 256];
+    let n = unsafe { libc::getgroups(ids.len() as i32, ids.as_mut_ptr()) };
+    ids.truncate(n.max(0) as usize);
+    ids.push(unsafe { libc::getegid() });
+    group_status_from(&group_file, &std::env::var("USER").unwrap_or_default(), &ids)
+}
+
+/// `process_gids` are the groups this process actually runs with; /etc/group
+/// says who *will* have them at their next login.
+fn group_status_from(group_file: &str, user: &str, process_gids: &[u32]) -> InputGroup {
+    let Some(line) = group_file.lines().find(|l| l.starts_with("input:")) else {
+        return InputGroup::Unknown;
+    };
+    let fields: Vec<&str> = line.split(':').collect();
+    let Some(gid) = fields.get(2).and_then(|g| g.parse::<u32>().ok()) else {
+        return InputGroup::Unknown;
+    };
+    if process_gids.contains(&gid) {
+        return InputGroup::Active;
+    }
+    let members = fields.get(3).copied().unwrap_or("");
+    if !user.is_empty() && members.split(',').any(|m| m == user) {
+        InputGroup::NeedsRelogin
+    } else {
+        InputGroup::NotMember
+    }
+}
+
+fn access_fix() -> String {
+    let start_now = "sg input -c \"cargo run --release\"";
+    match input_group_status() {
+        InputGroup::NotMember => format!(
+            "To fix, give your user access to input devices:\n\
+             \x20     sudo usermod -aG input $USER\n\
+             \x20 then log out and back in. To try it right away without logging out,\n\
+             \x20 start the monkey with:  {}",
+            start_now
+        ),
+        InputGroup::NeedsRelogin => format!(
+            "You're in the `input` group, but this login session started before you were\n\
+             \x20 added. Log out and back in, or start the monkey with:  {}",
+            start_now
+        ),
+        InputGroup::Active => "This process is in the `input` group but access was still refused;\n\
+             \x20 check `ls -l /dev/input/event*` (they should be readable by group `input`)."
+            .to_string(),
+        InputGroup::Unknown => {
+            "To fix: `sudo usermod -aG input $USER`, then log out and back in.".to_string()
+        }
+    }
+}
+
+/// Printed on every start so missing access is impossible to miss.
+fn print_input_summary(devices: &InputDevices) {
+    let count = |n: usize, what: &str| format!("OK ({} {})", n, what);
+    let touchpads = devices.pointers.iter().filter(|(_, t)| t.is_some()).count();
+    eprintln!("Mouse Monkey input access:");
+    eprintln!(
+        "  keyboard        {}",
+        if devices.keyboards.is_empty() {
+            "NOT AVAILABLE - he won't react to typing".to_string()
+        } else {
+            count(devices.keyboards.len(), "device(s)")
+        }
+    );
+    eprintln!(
+        "  mouse/touchpad  {}",
+        if devices.pointers.is_empty() {
+            "NOT AVAILABLE - he only notices the cursor while it's over him, and won't react to scrolling"
+                .to_string()
+        } else {
+            count(devices.pointers.len(), &format!("device(s), {} touchpad(s)", touchpads))
+        }
+    );
+    if devices.permission_denied > 0 && (devices.keyboards.is_empty() || devices.pointers.is_empty()) {
+        eprintln!("  {}", access_fix());
+    }
+    if devices.keyboards.is_empty() || devices.pointers.is_empty() {
+        eprintln!("  Test your devices with:  cargo run --release -- --check-input");
+    }
+}
+
+/// `--check-input`: lists input devices and listens briefly to prove which ones
+/// deliver keys, motion and scrolling.
+pub fn check_input() {
+    let devices = discover_input_devices();
+    println!("Input devices under /dev/input:");
+    for line in &devices.report {
+        println!("  {}", line);
+    }
+    println!();
+    print_input_summary(&devices);
+    if devices.keyboards.is_empty() && devices.pointers.is_empty() {
+        return;
+    }
+
+    const LISTEN_S: u64 = 10;
+    println!();
+    println!("Listening for {} seconds: type a few keys, move the mouse or touchpad, and scroll...", LISTEN_S);
+    let (tx, rx) = crossbeam_channel::unbounded::<(String, &'static str)>();
+    for mut dev in devices.keyboards {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let name = dev.name().unwrap_or("?").to_string();
+            while let Ok(events) = dev.fetch_events() {
+                for ev in events {
+                    if ev.event_type() == EventType::KEY && ev.value() == 1 {
+                        let _ = tx.send((name.clone(), "key presses"));
+                    }
+                }
+            }
+        });
+    }
+    for (mut dev, mut touchpad) in devices.pointers {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let name = dev.name().unwrap_or("?").to_string();
+            while let Ok(events) = dev.fetch_events() {
+                let (dx, dy, scroll) = read_pointer_batch(events, &mut touchpad);
+                if dx != 0.0 || dy != 0.0 {
+                    let _ = tx.send((name.clone(), "pointer moves"));
+                }
+                if scroll != 0.0 {
+                    let _ = tx.send((name.clone(), "scroll notches"));
+                }
+            }
+        });
+    }
+    drop(tx);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(LISTEN_S);
+    let mut counts: Vec<((String, &str), usize)> = Vec::new();
+    while let Ok(item) = rx.recv_deadline(deadline) {
+        match counts.iter_mut().find(|(k, _)| *k == item) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((item, 1)),
+        }
+    }
+    println!();
+    if counts.is_empty() {
+        println!("Nothing was received. If you did type and move the mouse, please report this");
+        println!("together with the device list above.");
+    }
+    for ((name, kind), n) in &counts {
+        println!("  {}: {} {}", name, n, kind);
+    }
+    let got = |kind: &str| counts.iter().any(|((_, k), _)| *k == kind);
+    println!();
+    println!("Typing:        {}", if got("key presses") { "works" } else { "no key presses received" });
+    println!("Cursor:        {}", if got("pointer moves") { "works" } else { "no movement received" });
+    println!("Scrolling:     {}", if got("scroll notches") { "works" } else { "no scrolling received" });
+    // Reader threads are blocked in fetch_events; exiting ends them.
+    std::process::exit(0);
+}
+
 impl WaylandDriver {
-    /// Spawns evdev reader threads for ALL keyboard and mouse devices found.
-    ///
-    /// **Device classification**:
-    /// - Keyboard: supports KEY events AND has KEY_A (excludes mice that
-    ///   report BTN_LEFT as a KEY event).
-    /// - Mouse: supports REL_X + REL_Y relative-axis events.
-    /// A combo device (e.g. keyboard with a trackpoint) is opened twice, once
-    /// per role.
-    ///
-    /// Every keyboard gets its own reader: a system often has several nodes
-    /// with letter keys (laptop keyboard, external keyboard, extra USB
-    /// interfaces, remapper virtual devices such as keyd), and there's no
-    /// reliable way to tell which one the user types on.
-    ///
-    /// **Cursor tracking**: Each mouse device gets its own accumulator thread
-    /// that reads REL_X/REL_Y deltas and emits MouseMove to `pending_events`.
-    /// Using `pending_events` (not the channel) avoids double-emission since
-    /// `poll_events` drains both the channel (keyboard) and pending_events.
-    ///
-    /// **Permissions**: Requires the process user to be in the `input` group
-    /// (`sudo usermod -aG input $USER`, then log out and back in).
+    /// Spawns a reader thread per keyboard and per mouse/touchpad.
+    /// Returns the thread handles and whether any pointer device is being read.
     fn setup_evdev_input(
         event_sender: crossbeam_channel::Sender<InputEvent>,
         wayland_state: Arc<Mutex<WaylandState>>,
     ) -> (Vec<thread::JoinHandle<()>>, bool) {
-        let mut key_devices: Vec<Device> = Vec::new();
-        let mut mouse_devices: Vec<Device> = Vec::new();
-        let mut permission_denied = 0usize;
-
-        if let Ok(entries) = std::fs::read_dir("/dev/input") {
-            let mut paths: Vec<_> = entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .map_or(false, |s| s.starts_with("event"))
-                })
-                .collect();
-            paths.sort();
-
-            for path in &paths {
-                let dev = match Device::open(path) {
-                    Ok(dev) => dev,
-                    Err(e) => {
-                        if e.kind() == io::ErrorKind::PermissionDenied {
-                            permission_denied += 1;
-                        }
-                        log::debug!("evdev: cannot open {:?}: {}", path, e);
-                        continue;
-                    }
-                };
-                let name = dev.name().unwrap_or("?").to_string();
-                let is_keyboard = dev.supported_events().contains(EventType::KEY)
-                    && dev
-                        .supported_keys()
-                        .map_or(false, |keys| keys.contains(evdev::Key::KEY_A));
-                let is_mouse = dev.supported_relative_axes().map_or(false, |axes| {
-                    axes.contains(RelativeAxisType::REL_X) && axes.contains(RelativeAxisType::REL_Y)
-                });
-
-                if is_keyboard {
-                    log::info!("evdev: keyboard device {:?} ({})", path, name);
-                    key_devices.push(dev);
-                    if is_mouse {
-                        match Device::open(path) {
-                            Ok(second) => {
-                                log::info!("evdev: mouse device {:?} ({})", path, name);
-                                mouse_devices.push(second);
-                            }
-                            Err(e) => log::debug!("evdev: cannot reopen {:?}: {}", path, e),
-                        }
-                    }
-                } else if is_mouse {
-                    log::info!("evdev: mouse device {:?} ({})", path, name);
-                    mouse_devices.push(dev);
-                }
-            }
+        let devices = discover_input_devices();
+        for line in &devices.report {
+            log::info!("evdev: {}", line);
         }
-
-        if key_devices.is_empty() || mouse_devices.is_empty() {
-            let msg = if permission_denied > 0 {
-                format!(
-                    "evdev: permission denied on {} input device(s), so typing, scrolling and \
-                     global cursor tracking are disabled. Fix: `sudo usermod -aG input $USER`, \
-                     then log out and back in (check with `id -nG | grep input`).",
-                    permission_denied
-                )
-            } else if key_devices.is_empty() {
-                "evdev: no keyboard device found; typing reactions are disabled.".to_string()
-            } else {
-                "evdev: no mouse device found; global cursor tracking and scrolling are disabled.".to_string()
-            };
-            log::warn!("{}", msg);
-            eprintln!("Warning (WaylandDriver): {}", msg);
-        }
+        print_input_summary(&devices);
 
         let mut handles = Vec::new();
 
@@ -185,7 +425,7 @@ impl WaylandDriver {
         // Some keyboards report the same press on two interfaces; drop a repeat
         // of the same key from another device within a few milliseconds.
         let last_press: Arc<Mutex<Option<(u16, std::time::Instant)>>> = Arc::new(Mutex::new(None));
-        for mut dev in key_devices {
+        for mut dev in devices.keyboards {
             let sender = event_sender.clone();
             let ws = Arc::clone(&wayland_state);
             let last_press = Arc::clone(&last_press);
@@ -222,12 +462,7 @@ impl WaylandDriver {
                                         log::info!("evdev: receiving key presses from {}", name);
                                         announced = true;
                                     }
-                                    let kind = match evdev::Key(ev.code()) {
-                                        evdev::Key::KEY_SPACE
-                                        | evdev::Key::KEY_ENTER
-                                        | evdev::Key::KEY_KPENTER => KeyKind::Thump,
-                                        _ => KeyKind::Other,
-                                    };
+                                    let kind = key_kind(ev.code());
                                     let _ = sender.send(InputEvent::KeyDown { key_code, kind });
                                 } else if ev.value() == 0 {
                                     let _ = sender.send(InputEvent::KeyUp { key_code });
@@ -240,74 +475,49 @@ impl WaylandDriver {
             }));
         }
 
-        // ── Mouse tracking threads (one per device) ────────────────────────────
-        // We spawn a thread for EVERY mouse device found (e.g. touchpad AND
-        // external USB mouse).  Each accumulates REL deltas independently and
-        // writes into the shared global_cursor_pos.  Mouse events go into
-        // pending_events ONLY (not the channel) to avoid double-counting in
-        // poll_events() which drains both sources.
-        let has_mouse = !mouse_devices.is_empty();
-        for mut dev in mouse_devices {
+        // ── Pointer threads (one per mouse/touchpad) ───────────────────────────
+        // Each accumulates motion into the shared cursor position. Pointer
+        // events go into pending_events only (not the channel) to avoid
+        // double-counting in poll_events(), which drains both.
+        let has_pointer = !devices.pointers.is_empty();
+        for (mut dev, mut touchpad) in devices.pointers {
             let ws = Arc::clone(&wayland_state);
             handles.push(thread::spawn(move || {
-                log::info!("evdev mouse thread started for: {}", dev.name().unwrap_or("?"));
+                log::info!("evdev: pointer thread started for {}", dev.name().unwrap_or("?"));
                 loop {
                     if !ws.lock().unwrap().running {
                         break;
                     }
                     match dev.fetch_events() {
                         Err(e) => {
-                            log::warn!("evdev mouse read error: {}", e);
+                            log::warn!("evdev: pointer read error: {}", e);
                             thread::sleep(Duration::from_millis(100));
                         }
                         Ok(events) => {
-                            let mut dx = 0i32;
-                            let mut dy = 0i32;
-                            let mut wheel = 0i32;
-                            for ev in events {
-                                if ev.event_type() == EventType::RELATIVE {
-                                    match RelativeAxisType(ev.code()) {
-                                        RelativeAxisType::REL_X => dx += ev.value(),
-                                        RelativeAxisType::REL_Y => dy += ev.value(),
-                                        RelativeAxisType::REL_WHEEL => wheel += ev.value(),
-                                        _ => {}
-                                    }
-                                }
+                            let (dx, dy, scroll) = read_pointer_batch(events, &mut touchpad);
+                            let mut s = ws.lock().unwrap();
+                            if scroll != 0.0 {
+                                s.pending_events.push(InputEvent::Scroll { delta: scroll });
                             }
-                            if wheel != 0 {
-                                // evdev reports wheel-up as positive; we use positive = down.
-                                ws.lock().unwrap().pending_events.push(InputEvent::Scroll {
-                                    delta: -wheel as f32,
-                                });
-                            }
-                            if dx != 0 || dy != 0 {
-                                let mut s = ws.lock().unwrap();
-
-                                // Use current global position as base
-                                let (mut cx, mut cy) = s.global_cursor_pos;
-
+                            if dx != 0.0 || dy != 0.0 {
                                 // Cursor coordinates are surface-local (they are
                                 // recalibrated from Wayland pointer events), so
                                 // keep them within our overlay surface.
-                                let (min_x, min_y) = (0.0f32, 0.0f32);
-                                let max_x = s.window_size.0 as f32;
-                                let max_y = s.window_size.1 as f32;
-
-                                cx = (cx + dx as f32).clamp(min_x, max_x - 1.0);
-                                cy = (cy + dy as f32).clamp(min_y, max_y - 1.0);
-
-                                s.global_cursor_pos = (cx, cy);
-                                s.pending_events.push(InputEvent::MouseMove { x: cx, y: cy });
+                                let max_x = s.window_size.0 as f32 - 1.0;
+                                let max_y = s.window_size.1 as f32 - 1.0;
+                                let (cx, cy) = s.global_cursor_pos;
+                                let pos = ((cx + dx).clamp(0.0, max_x), (cy + dy).clamp(0.0, max_y));
+                                s.global_cursor_pos = pos;
+                                s.pending_events.push(InputEvent::MouseMove { x: pos.0, y: pos.1 });
                             }
                         }
                     }
-                    // Reduced sleep to improve responsiveness while maintaining low CPU
                     thread::sleep(Duration::from_millis(5));
                 }
             }));
         }
 
-        (handles, has_mouse)
+        (handles, has_pointer)
     }
 }
 
@@ -590,41 +800,20 @@ impl PlatformDriver for WaylandDriver {
             })?;
         surface.damage(0, 0, width, height);
 
-        // Input region strategy:
-        // Always restrict the input region to the monkey sprite area to allow
-        // click-through to other apps. When evdev is inactive, add a tracking
-        // margin around the monkey so Wayland delivers motion events nearby
-        // for eye-follow. During an active drag, expand to the full surface
-        // so we don't lose pointer events mid-drag.
-        let (evdev_active, is_dragging) = {
-            let s = self.wayland_state.lock().unwrap();
-            (s.evdev_active, s.is_dragging)
-        };
+        // Input region: only the monkey's own body takes clicks and scrolls;
+        // everything else passes through to the windows underneath. (Global
+        // reactions come from evdev, never from widening this region.) During
+        // a drag the whole surface takes input so pointer motion isn't lost.
+        let is_dragging = self.wayland_state.lock().unwrap().is_dragging;
         let region = self.driver_state.compositor_state.wl_compositor().create_region(&self.queue_handle, ());
         if is_dragging {
-            // During drag, accept input everywhere so pointer motion isn't lost.
             region.add(0, 0, width, height);
         } else {
             let (pos_x, pos_y) = sprite_data.position;
             let (scale_x, scale_y) = sprite_data.scale;
-            let frame_w = sprite_data.sprite_sheet.frame_width as f32;
-            let frame_h = sprite_data.sprite_sheet.frame_height as f32;
-            let monkey_w = (frame_w * scale_x).round() as i32;
-            let monkey_h = (frame_h * scale_y).round() as i32;
-
-            if evdev_active {
-                // Tight input region — evdev handles global tracking.
-                region.add(pos_x.round() as i32, pos_y.round() as i32, monkey_w, monkey_h);
-            } else {
-                // Wider margin to capture nearby motion events for eye-follow.
-                // The margin extends 300px in every direction around the sprite.
-                let margin = 300i32;
-                let rx = (pos_x.round() as i32 - margin).max(0);
-                let ry = (pos_y.round() as i32 - margin).max(0);
-                let rw = (monkey_w + margin * 2).min(width - rx);
-                let rh = (monkey_h + margin * 2).min(height - ry);
-                region.add(rx, ry, rw, rh);
-            }
+            let monkey_w = (sprite_data.sprite_sheet.frame_width as f32 * scale_x).round() as i32;
+            let monkey_h = (sprite_data.sprite_sheet.frame_height as f32 * scale_y).round() as i32;
+            region.add(pos_x.round() as i32, pos_y.round() as i32, monkey_w, monkey_h);
         }
         surface.set_input_region(Some(&region));
         region.destroy();
@@ -970,3 +1159,17 @@ delegate_shm!(WaylandDriverState);
 delegate_layer!(WaylandDriverState);
 delegate_seat!(WaylandDriverState);
 delegate_pointer!(WaylandDriverState);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GROUPS: &str = "root:x:0:\ninput:x:104:arosa,bob\nusers:x:100:\n";
+
+    #[test]
+    fn group_membership_is_diagnosed() {
+        assert_eq!(group_status_from(GROUPS, "arosa", &[1000, 104]), InputGroup::Active);
+        assert_eq!(group_status_from(GROUPS, "arosa", &[1000, 27]), InputGroup::NeedsRelogin);
+        assert_eq!(group_status_from(GROUPS, "carol", &[1000]), InputGroup::NotMember);
+        assert_eq!(group_status_from("root:x:0:\n", "arosa", &[1000]), InputGroup::Unknown);
+    }
+}
