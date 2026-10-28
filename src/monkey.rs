@@ -1,3 +1,4 @@
+use crate::config::KeepOut;
 use crate::platform::{InputEvent, KeyKind, MouseButton, PlatformDriver, Rect};
 use crate::state::PetState;
 use log::{debug, info, warn};
@@ -59,6 +60,8 @@ const NOTCHES_TO_PEEL: f32 = 12.0;
 const SNACK_GIVE_UP_S: f32 = 4.0;
 const EAT_S: f32 = 1.4;
 
+/// Gap left between a resting monkey and the keep-out zone (> wiggle amplitude).
+const KEEP_OUT_MARGIN_PX: f32 = 4.0;
 const MICRO_WIGGLE_INTERVAL_FRAMES: u64 = 500;
 const MICRO_WIGGLE_DURATION_S: f32 = 0.4;
 const MICRO_WIGGLE_AMPLITUDE_PX: f32 = 2.0;
@@ -143,6 +146,8 @@ pub struct Monkey {
     jelly: f32,
     jelly_velocity: f32,
 
+    keep_out: Option<KeepOut>,
+
     sprite_width: u32,
     sprite_height: u32,
 }
@@ -201,6 +206,8 @@ impl Monkey {
 
             jelly: 0.0,
             jelly_velocity: 0.0,
+
+            keep_out: None,
 
             sprite_width,
             sprite_height,
@@ -354,6 +361,7 @@ impl Monkey {
         self.update_jelly(dt);
 
         if self.state != PetState::Dragged {
+            self.leave_keep_out(platform_driver);
             self.clamp_to_screen_bounds(platform_driver);
         }
     }
@@ -663,7 +671,57 @@ impl Monkey {
         let (l, t) = (screen.x as f32 + hw, screen.y as f32 + hh);
         let r = (screen.x + screen.width as i32) as f32 - hw;
         let b = (screen.y + screen.height as i32) as f32 - hh;
-        (x.clamp(l, r.max(l)), y.clamp(t, b.max(t)))
+        let (x, y) = (x.clamp(l, r.max(l)), y.clamp(t, b.max(t)));
+        // The monkey rests where it ends up, so stop outside the keep-out zone.
+        let (px, py) = self.outside_keep_out((x - hw, y - hh), screen);
+        (px + hw, py + hh)
+    }
+
+    pub fn set_keep_out(&mut self, keep_out: KeepOut) {
+        let valid = keep_out.right > keep_out.left && keep_out.bottom > keep_out.top;
+        self.keep_out = valid.then_some(keep_out);
+    }
+
+    /// Nearest top-left position to `pos` where the sprite lies entirely
+    /// outside the keep-out zone of `screen` (unchanged if it already does).
+    fn outside_keep_out(&self, pos: (f32, f32), screen: Rect) -> (f32, f32) {
+        let Some(k) = self.keep_out else {
+            return pos;
+        };
+        let (w, h) = (self.sprite_width as f32, self.sprite_height as f32);
+        let (sx, sy) = (screen.x as f32, screen.y as f32);
+        let (sw, sh) = (screen.width as f32, screen.height as f32);
+        let (zl, zr) = (sx + k.left * sw, sx + k.right * sw);
+        let (zt, zb) = (sy + k.top * sh, sy + k.bottom * sh);
+        if pos.0 + w <= zl || pos.0 >= zr || pos.1 + h <= zt || pos.1 >= zb {
+            return pos;
+        }
+        let candidates = [
+            (zl - KEEP_OUT_MARGIN_PX - w, pos.1),
+            (zr + KEEP_OUT_MARGIN_PX, pos.1),
+            (pos.0, zt - KEEP_OUT_MARGIN_PX - h),
+            (pos.0, zb + KEEP_OUT_MARGIN_PX),
+        ];
+        let on_screen = |c: &&(f32, f32)| c.0 >= sx && c.0 + w <= sx + sw && c.1 >= sy && c.1 + h <= sy + sh;
+        let dist = |c: &(f32, f32)| (c.0 - pos.0).abs() + (c.1 - pos.1).abs();
+        candidates
+            .iter()
+            .filter(on_screen)
+            .min_by(|a, b| dist(a).total_cmp(&dist(b)))
+            .copied()
+            .unwrap_or(pos)
+    }
+
+    /// Moving (hunting), held and flying monkeys may cross the keep-out
+    /// zone; everything else is resting and gets nudged out of it.
+    fn leave_keep_out(&mut self, platform_driver: &dyn PlatformDriver) {
+        if matches!(self.state, PetState::Dragged | PetState::Hunting | PetState::Dramatic) {
+            return;
+        }
+        let screens = platform_driver.get_screen_bounds();
+        if let Some(screen) = Self::screen_under(&screens, self.center().0) {
+            self.position = self.outside_keep_out(self.position, screen);
+        }
     }
 
     fn update_jelly(&mut self, dt: f32) {
@@ -795,6 +853,30 @@ mod tests {
 
     fn mv(x: f32, y: f32) -> InputEvent {
         InputEvent::MouseMove { x, y }
+    }
+
+    fn overlaps_keep_out(m: &Monkey, d: &MockDriver) -> bool {
+        let k = m.keep_out.unwrap();
+        let s = d.screens[0];
+        let (zl, zr) = (k.left * s.width as f32, k.right * s.width as f32);
+        let (zt, zb) = (k.top * s.height as f32, k.bottom * s.height as f32);
+        let (x, y) = m.position;
+        x + 128.0 > zl && x < zr && y + 128.0 > zt && y < zb
+    }
+
+    #[test]
+    fn never_rests_inside_the_keep_out_zone() {
+        let (mut m, d) = setup(); // starts mid-screen, inside the zone
+        m.set_keep_out(KeepOut::default());
+        idle_for(&mut m, &d, 0.1);
+        assert!(!overlaps_keep_out(&m, &d), "pushed out when resting inside");
+
+        // Walking to a cursor parked in the middle ends outside the zone.
+        d.cursor.set((960.0, 540.0));
+        m.cursor_inactivity_s = CURSOR_INACTIVITY_THRESHOLD_S;
+        idle_for(&mut m, &d, 15.0);
+        assert_eq!(m.state, PetState::Idle);
+        assert!(!overlaps_keep_out(&m, &d), "stopped outside the zone");
     }
 
     #[test]
