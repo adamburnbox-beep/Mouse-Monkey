@@ -3,6 +3,14 @@ window_height = 1080
 window_title = "Mouse Monkey Companion"
 tick_rate_hz = 60
 
+# The monkey may walk across this region but never rests inside it.
+# Fractions of each screen's size.
+[keep_out]
+left = 0.10
+top = 0.14
+right = 0.89
+bottom = 0.875
+
 [sprite]
 sheet_path = "assets/sprites/monkey_directional.png"
 frame_width = 128

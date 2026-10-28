@@ -72,6 +72,7 @@ fn main() -> io::Result<()> {
         sprite_sheet.frame_width,
         sprite_sheet.frame_height,
     );
+    monkey.set_keep_out(config.keep_out);
 
     let target_frame_duration = Duration::from_secs_f32(1.0 / config.tick_rate_hz as f32);
     let mut last_frame_time = Instant::now();
