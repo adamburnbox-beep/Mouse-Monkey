@@ -57,7 +57,7 @@ const BOOP_FPS: f32 = 12.0;
 
 // Scrolling peels a banana, then the monkey eats it.
 const NOTCHES_TO_PEEL: f32 = 12.0;
-const SNACK_GIVE_UP_S: f32 = 4.0;
+const SNACK_GIVE_UP_S: f32 = 2.0;
 const EAT_S: f32 = 1.4;
 
 /// Gap left between a resting monkey and the keep-out zone (> wiggle amplitude).
