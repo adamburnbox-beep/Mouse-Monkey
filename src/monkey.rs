@@ -147,6 +147,8 @@ pub struct Monkey {
     jelly_velocity: f32,
 
     keep_out: Option<KeepOut>,
+    /// Centre point to walk to instead of the cursor (leaving the keep-out zone).
+    walk_target: Option<(f32, f32)>,
 
     sprite_width: u32,
     sprite_height: u32,
@@ -208,6 +210,7 @@ impl Monkey {
             jelly_velocity: 0.0,
 
             keep_out: None,
+            walk_target: None,
 
             sprite_width,
             sprite_height,
@@ -258,6 +261,9 @@ impl Monkey {
                 self.position = base;
             }
             self.micro_wiggle_start = None;
+        }
+        if self.state == PetState::Hunting && new_state != PetState::Hunting {
+            self.walk_target = None;
         }
         if self.state == PetState::Hunting && self.chase_deadline.take().is_some() {
             self.chase_cooldown_until = self.clock + CHASE_COOLDOWN_S;
@@ -514,10 +520,12 @@ impl Monkey {
             PetState::Hunting => {
                 // Aim for the cursor, but only as far as the monkey can fully
                 // fit on screen; otherwise it would walk into an edge forever.
-                let (target_x, target_y) = self.reachable_target(
-                    platform_driver.get_cursor_pos(),
-                    &platform_driver.get_screen_bounds(),
-                );
+                let (target_x, target_y) = self.walk_target.unwrap_or_else(|| {
+                    self.reachable_target(
+                        platform_driver.get_cursor_pos(),
+                        &platform_driver.get_screen_bounds(),
+                    )
+                });
                 let (monkey_cx, monkey_cy) = self.center();
                 let dx = target_x - monkey_cx;
                 let dy = target_y - monkey_cy;
@@ -712,15 +720,23 @@ impl Monkey {
             .unwrap_or(pos)
     }
 
-    /// Moving (hunting), held and flying monkeys may cross the keep-out
-    /// zone; everything else is resting and gets nudged out of it.
+    /// A monkey left idle inside the keep-out zone (e.g. dropped there) walks
+    /// to the nearest spot outside it. Held and flying monkeys may cross it.
     fn leave_keep_out(&mut self, platform_driver: &dyn PlatformDriver) {
-        if matches!(self.state, PetState::Dragged | PetState::Hunting | PetState::Dramatic) {
+        if self.state != PetState::Idle {
             return;
         }
         let screens = platform_driver.get_screen_bounds();
-        if let Some(screen) = Self::screen_under(&screens, self.center().0) {
-            self.position = self.outside_keep_out(self.position, screen);
+        let Some(screen) = Self::screen_under(&screens, self.center().0) else {
+            return;
+        };
+        let dest = self.outside_keep_out(self.position, screen);
+        if dest != self.position {
+            let (hw, hh) = (self.sprite_width as f32 / 2.0, self.sprite_height as f32 / 2.0);
+            self.hunting_speed = WALK_SPEED_PX_PER_S;
+            self.transition_to(PetState::Hunting);
+            self.walk_target = Some((dest.0 + hw, dest.1 + hh));
+            info!("Monkey: walking out of the keep-out zone.");
         }
     }
 
@@ -869,7 +885,10 @@ mod tests {
         let (mut m, d) = setup(); // starts mid-screen, inside the zone
         m.set_keep_out(KeepOut::default());
         idle_for(&mut m, &d, 0.1);
-        assert!(!overlaps_keep_out(&m, &d), "pushed out when resting inside");
+        assert_eq!(m.state, PetState::Hunting, "starts walking out");
+        idle_for(&mut m, &d, 6.0);
+        assert_eq!(m.state, PetState::Idle);
+        assert!(!overlaps_keep_out(&m, &d), "walked out when resting inside");
 
         // Walking to a cursor parked in the middle ends outside the zone.
         d.cursor.set((960.0, 540.0));
