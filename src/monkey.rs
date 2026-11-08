@@ -20,18 +20,33 @@ const ROW_SNACK: u32 = 12;
 const ROW_BOOP: u32 = 13;
 pub const SHEET_ROWS: u32 = 14;
 
-// Hunting: slow walk after inactivity, fast chase after a mouse flick.
+// Hunting: slow walk after inactivity, fast run when summoned.
 const WALK_SPEED_PX_PER_S: f32 = 180.0;
-const CHASE_SPEED_PX_PER_S: f32 = 700.0;
+const RUN_SPEED_PX_PER_S: f32 = 700.0;
 const HUNTING_DISTANCE_THRESHOLD_PX: f32 = 10.0;
 const CURSOR_INACTIVITY_THRESHOLD_S: f32 = 300.0;
-const CHASE_TRIGGER_SPEED_PX_PER_S: f32 = 2200.0;
-/// Accumulated time the cursor must spend above the trigger speed, so a single
-/// teleport (e.g. cursor recalibration) can't start a chase.
-const CHASE_TRIGGER_HOLD_S: f32 = 0.12;
-const CHASE_MIN_DISTANCE_PX: f32 = 160.0;
-const CHASE_MAX_S: f32 = 4.0;
-const CHASE_COOLDOWN_S: f32 = 6.0;
+
+// Summoning: draw a circle with the cursor and the monkey runs to it.
+/// A loop must be drawn within this long; older cursor samples are forgotten.
+const CIRCLE_MAX_S: f32 = 2.0;
+/// Faster than this is a flick, not a deliberate circle.
+const CIRCLE_MIN_S: f32 = 0.2;
+/// Cursor samples closer together than this are skipped (jitter).
+const CIRCLE_SAMPLE_SPACING_PX: f32 = 3.0;
+const CIRCLE_MIN_SAMPLES: usize = 10;
+const CIRCLE_MAX_SAMPLES: usize = 160;
+const CIRCLE_MIN_RADIUS_PX: f32 = 25.0;
+const CIRCLE_MAX_RADIUS_PX: f32 = 450.0;
+/// How far round the loop must go: 90% of a full turn.
+const CIRCLE_MIN_TURN_RAD: f32 = 2.0 * PI * 0.9;
+/// Turning back against the loop's direction, as a share of the total turn.
+const CIRCLE_MAX_BACKTRACK: f32 = 0.15;
+/// Every point's distance from the centre, relative to the average. Rejects
+/// zig-zags, which pass through their own centre.
+const CIRCLE_MIN_ROUNDNESS: f32 = 0.45;
+const CIRCLE_MAX_ROUNDNESS: f32 = 1.8;
+/// A single step that jumps further round than this means a gap, not a loop.
+const CIRCLE_MAX_STEP_RAD: f32 = PI / 2.0;
 
 // Typing: paws alternate per keystroke; typing speed heats the monkey up.
 const TYPING_LINGER_S: f32 = 1.5;
@@ -105,8 +120,9 @@ pub struct Monkey {
     current_mouse_pos: (f32, f32),
     current_mouse_velocity: (f32, f32),
     smoothed_mouse_velocity: (f32, f32),
-    fast_move_s: f32,
     cursor_known: bool,
+    /// Recent cursor positions (time, position) for spotting a drawn circle.
+    cursor_trail: VecDeque<(f32, (f32, f32))>,
 
     // Dragging / clicking
     is_dragging: bool,
@@ -114,10 +130,7 @@ pub struct Monkey {
     press_pos: (f32, f32),
     press_time: f32,
 
-    // Hunting
     hunting_speed: f32,
-    chase_deadline: Option<f32>,
-    chase_cooldown_until: f32,
 
     // Typing
     key_times: VecDeque<f32>,
@@ -147,7 +160,8 @@ pub struct Monkey {
     jelly_velocity: f32,
 
     keep_out: Option<KeepOut>,
-    /// Centre point to walk to instead of the cursor (leaving the keep-out zone).
+    /// Centre point to head for instead of the cursor (leaving the keep-out
+    /// zone, or running to a drawn circle).
     walk_target: Option<(f32, f32)>,
 
     sprite_width: u32,
@@ -175,8 +189,8 @@ impl Monkey {
             current_mouse_pos: (0.0, 0.0),
             current_mouse_velocity: (0.0, 0.0),
             smoothed_mouse_velocity: (0.0, 0.0),
-            fast_move_s: 0.0,
             cursor_known: false,
+            cursor_trail: VecDeque::new(),
 
             is_dragging: false,
             drag_anchor_offset: (0.0, 0.0),
@@ -184,8 +198,6 @@ impl Monkey {
             press_time: 0.0,
 
             hunting_speed: WALK_SPEED_PX_PER_S,
-            chase_deadline: None,
-            chase_cooldown_until: 0.0,
 
             key_times: VecDeque::new(),
             last_key_time: f32::NEG_INFINITY,
@@ -265,9 +277,6 @@ impl Monkey {
         if self.state == PetState::Hunting && new_state != PetState::Hunting {
             self.walk_target = None;
         }
-        if self.state == PetState::Hunting && self.chase_deadline.take().is_some() {
-            self.chase_cooldown_until = self.clock + CHASE_COOLDOWN_S;
-        }
         debug!("Monkey: {:?} -> {:?}", self.state, new_state);
         self.state = new_state;
         self.state_animation_time = 0.0;
@@ -342,11 +351,10 @@ impl Monkey {
         let alpha = 1.0 - (-dt / 0.06).exp();
         self.smoothed_mouse_velocity.0 += (self.current_mouse_velocity.0 - self.smoothed_mouse_velocity.0) * alpha;
         self.smoothed_mouse_velocity.1 += (self.current_mouse_velocity.1 - self.smoothed_mouse_velocity.1) * alpha;
-        let cursor_speed = self.current_mouse_velocity.0.hypot(self.current_mouse_velocity.1);
-        if cursor_speed > CHASE_TRIGGER_SPEED_PX_PER_S {
-            self.fast_move_s += dt;
-        } else {
-            self.fast_move_s = (self.fast_move_s - dt).max(0.0);
+        if mouse_moved_this_tick {
+            if let Some(centre) = self.track_circle(now) {
+                self.summon(centre, platform_driver);
+            }
         }
 
         if mouse_moved_this_tick {
@@ -471,6 +479,111 @@ impl Monkey {
         self.stroke_travel = dx.abs();
     }
 
+    /// Records the cursor position and returns the centre of a circle if the
+    /// cursor has just finished drawing one.
+    fn track_circle(&mut self, now: f32) -> Option<(f32, f32)> {
+        if self.state == PetState::Dragged {
+            self.cursor_trail.clear();
+            return None;
+        }
+        let pos = self.current_mouse_pos;
+        if let Some(&(_, last)) = self.cursor_trail.back() {
+            if (pos.0 - last.0).hypot(pos.1 - last.1) < CIRCLE_SAMPLE_SPACING_PX {
+                return None;
+            }
+        }
+        self.cursor_trail.push_back((now, pos));
+        while self.cursor_trail.len() > CIRCLE_MAX_SAMPLES
+            || self.cursor_trail.front().map_or(false, |(t, _)| now - t > CIRCLE_MAX_S)
+        {
+            self.cursor_trail.pop_front();
+        }
+        let centre = Self::find_circle(self.cursor_trail.make_contiguous())?;
+        // Start afresh so the same loop can't fire twice.
+        self.cursor_trail.clear();
+        Some(centre)
+    }
+
+    /// Looks for a loop ending at the newest sample, trying the shortest
+    /// stretch of the trail first. Returns the loop's centre.
+    fn find_circle(trail: &[(f32, (f32, f32))]) -> Option<(f32, f32)> {
+        let n = trail.len();
+        let end_time = trail.last()?.0;
+        for start in (0..n.saturating_sub(CIRCLE_MIN_SAMPLES - 1)).rev() {
+            let duration = end_time - trail[start].0;
+            if duration < CIRCLE_MIN_S {
+                continue;
+            }
+            if let Some(centre) = Self::loop_centre(&trail[start..]) {
+                return Some(centre);
+            }
+        }
+        None
+    }
+
+    /// The centre of `points` if they go once round it in a roughly round loop.
+    fn loop_centre(points: &[(f32, (f32, f32))]) -> Option<(f32, f32)> {
+        let count = points.len() as f32;
+        let (sx, sy) = points.iter().fold((0.0, 0.0), |(sx, sy), (_, p)| (sx + p.0, sy + p.1));
+        let (cx, cy) = (sx / count, sy / count);
+
+        let dist = |p: &(f32, f32)| (p.0 - cx).hypot(p.1 - cy);
+        let radius = points.iter().map(|(_, p)| dist(p)).sum::<f32>() / count;
+        if !(CIRCLE_MIN_RADIUS_PX..=CIRCLE_MAX_RADIUS_PX).contains(&radius) {
+            return None;
+        }
+        let round = points.iter().all(|(_, p)| {
+            let r = dist(p) / radius;
+            (CIRCLE_MIN_ROUNDNESS..=CIRCLE_MAX_ROUNDNESS).contains(&r)
+        });
+        if !round {
+            return None;
+        }
+
+        // Add up how far round the centre the cursor travelled, step by step.
+        let (mut forward, mut backward) = (0.0f32, 0.0f32);
+        for pair in points.windows(2) {
+            let a0 = (pair[0].1 .1 - cy).atan2(pair[0].1 .0 - cx);
+            let a1 = (pair[1].1 .1 - cy).atan2(pair[1].1 .0 - cx);
+            let mut step = a1 - a0;
+            if step > PI {
+                step -= 2.0 * PI;
+            } else if step < -PI {
+                step += 2.0 * PI;
+            }
+            if step.abs() > CIRCLE_MAX_STEP_RAD {
+                return None;
+            }
+            if step >= 0.0 {
+                forward += step;
+            } else {
+                backward -= step;
+            }
+        }
+        let (turn, against) = if forward >= backward { (forward, backward) } else { (backward, forward) };
+        let net = turn - against;
+        (net >= CIRCLE_MIN_TURN_RAD && against <= CIRCLE_MAX_BACKTRACK * turn).then_some((cx, cy))
+    }
+
+    /// Runs to a drawn circle, ending up outside the keep-out zone.
+    fn summon(&mut self, centre: (f32, f32), platform_driver: &dyn PlatformDriver) {
+        if !matches!(
+            self.state,
+            PetState::Idle | PetState::MicroWiggle | PetState::Petted | PetState::Booped | PetState::Hunting
+        ) {
+            return;
+        }
+        let target = self.reachable_target(centre, &platform_driver.get_screen_bounds());
+        let (cx, cy) = self.center();
+        if (target.0 - cx).hypot(target.1 - cy) < HUNTING_DISTANCE_THRESHOLD_PX {
+            return; // Already there.
+        }
+        self.transition_to(PetState::Hunting);
+        self.hunting_speed = RUN_SPEED_PX_PER_S;
+        self.walk_target = Some(target);
+        info!("Monkey: summoned by a circle at ({:.0}, {:.0}).", centre.0, centre.1);
+    }
+
     fn update_state(&mut self, now: f32, dt: f32, platform_driver: &dyn PlatformDriver) {
         let t = self.state_animation_time;
         match self.state {
@@ -479,20 +592,9 @@ impl Monkey {
                 self.current_animation_row = self.gaze_sector;
                 self.current_animation_frame_index = (t * 2.0) as u32 % 4;
 
-                let (cx, cy) = self.center();
-                let cursor_dist = (self.current_mouse_pos.0 - cx).hypot(self.current_mouse_pos.1 - cy);
-
                 if self.strokes.len() >= PET_STROKES_TO_START {
                     self.transition_to(PetState::Petted);
                     info!("Monkey: being petted, purring.");
-                } else if self.fast_move_s >= CHASE_TRIGGER_HOLD_S
-                    && now >= self.chase_cooldown_until
-                    && cursor_dist > CHASE_MIN_DISTANCE_PX
-                {
-                    self.hunting_speed = CHASE_SPEED_PX_PER_S;
-                    self.transition_to(PetState::Hunting);
-                    self.chase_deadline = Some(now + CHASE_MAX_S);
-                    info!("Monkey: chasing the cursor.");
                 } else if self.cursor_inactivity_s >= CURSOR_INACTIVITY_THRESHOLD_S {
                     self.hunting_speed = WALK_SPEED_PX_PER_S;
                     self.transition_to(PetState::Hunting);
@@ -530,27 +632,18 @@ impl Monkey {
                 let dx = target_x - monkey_cx;
                 let dy = target_y - monkey_cy;
                 let distance = dx.hypot(dy);
-                let chasing = self.chase_deadline.is_some();
+                let running = self.hunting_speed > WALK_SPEED_PX_PER_S;
 
                 if distance < self.hunting_speed * dt || distance < HUNTING_DISTANCE_THRESHOLD_PX {
                     self.position.0 = target_x - self.sprite_width as f32 / 2.0;
                     self.position.1 = target_y - self.sprite_height as f32 / 2.0;
-                    if chasing {
-                        // Caught it: celebrate with the boop hop.
-                        self.transition_to(PetState::Booped);
-                        info!("Monkey: caught the cursor!");
-                    } else {
-                        self.transition_to(PetState::Idle);
-                        info!("Monkey: reached the cursor.");
-                    }
-                } else if self.chase_deadline.map_or(false, |d| now > d) {
                     self.transition_to(PetState::Idle);
-                    info!("Monkey: gave up the chase.");
+                    info!("Monkey: arrived.");
                 } else {
                     self.position.0 += dx / distance * self.hunting_speed * dt;
                     self.position.1 += dy / distance * self.hunting_speed * dt;
                     // Look where it's going; cycle the walk-step columns 4-7.
-                    let steps_per_s = if chasing { 14.0 } else { 8.0 };
+                    let steps_per_s = if running { 14.0 } else { 8.0 };
                     self.current_animation_row = Self::sector_towards(dx, dy);
                     self.current_animation_frame_index = 4 + (t * steps_per_s) as u32 % 4;
                 }
@@ -1017,29 +1110,140 @@ mod tests {
         assert_eq!(m.state, PetState::Idle);
     }
 
-    #[test]
-    fn fast_mouse_flick_triggers_a_chase_that_ends_in_a_catch() {
-        let (mut m, d) = setup();
-        for i in 0..20 {
-            step(&mut m, &d, &[mv(600.0 + i as f32 * 60.0, 600.0)]);
+    /// Moves the cursor once round a circle, one step per tick.
+    fn draw_circle(m: &mut Monkey, d: &MockDriver, centre: (f32, f32), radius: f32, ticks: u32) {
+        for i in 0..=ticks {
+            let a = i as f32 / ticks as f32 * 2.0 * PI;
+            step(m, d, &[mv(centre.0 + radius * a.cos(), centre.1 + radius * a.sin())]);
         }
-        assert_eq!(m.state, PetState::Hunting);
-        assert!((4..8).contains(&m.current_animation_frame_index), "walk-step columns");
-        let mut caught = false;
-        for _ in 0..240 {
-            step(&mut m, &d, &[]);
-            if m.state == PetState::Booped {
-                caught = true;
-                break;
+    }
+
+    fn run_until_idle(m: &mut Monkey, d: &MockDriver, seconds: f32) {
+        for _ in 0..(seconds / DT) as u32 {
+            step(m, d, &[]);
+            if m.state == PetState::Idle {
+                return;
             }
         }
-        assert!(caught);
-        idle_for(&mut m, &d, 1.0);
-        // A second flick right away is ignored (cooldown).
-        for i in 0..20 {
-            step(&mut m, &d, &[mv(1700.0 - i as f32 * 60.0, 300.0)]);
+    }
+
+    #[test]
+    fn drawing_a_circle_summons_the_monkey_there() {
+        let (mut m, d) = setup();
+        draw_circle(&mut m, &d, (1500.0, 800.0), 80.0, 40);
+        assert_eq!(m.state, PetState::Hunting);
+        assert!((4..8).contains(&m.current_animation_frame_index), "walk-step columns");
+        assert!(m.hunting_speed > WALK_SPEED_PX_PER_S, "runs");
+        // He heads for where the circle was, not where the cursor goes next.
+        step(&mut m, &d, &[mv(100.0, 100.0)]);
+        run_until_idle(&mut m, &d, 4.0);
+        assert_eq!(m.state, PetState::Idle);
+        let (cx, cy) = m.center();
+        assert!((cx - 1500.0).abs() < 15.0 && (cy - 800.0).abs() < 15.0, "{:?}", m.center());
+    }
+
+    #[test]
+    fn counter_clockwise_and_wobbly_circles_also_work() {
+        let (mut m, d) = setup();
+        // A squashed, lumpy loop drawn the other way round.
+        for i in 0..=36 {
+            let a = -(i as f32) / 36.0 * 2.0 * PI;
+            let r = 70.0 + 15.0 * (a * 3.0).sin();
+            step(&mut m, &d, &[mv(1300.0 + 1.6 * r * a.cos(), 300.0 + r * a.sin())]);
         }
-        assert_ne!(m.state, PetState::Hunting);
+        assert_eq!(m.state, PetState::Hunting);
+    }
+
+    #[test]
+    fn summoned_into_the_keep_out_zone_stops_outside_it() {
+        let (mut m, d) = setup();
+        m.set_keep_out(KeepOut::default());
+        idle_for(&mut m, &d, 6.0); // walks out of the zone first
+        draw_circle(&mut m, &d, (960.0, 540.0), 100.0, 40); // dead centre of the zone
+        assert_eq!(m.state, PetState::Hunting);
+        run_until_idle(&mut m, &d, 5.0);
+        assert_eq!(m.state, PetState::Idle);
+        assert!(!overlaps_keep_out(&m, &d), "rested outside the zone: {:?}", m.position);
+        idle_for(&mut m, &d, 1.0);
+        assert_eq!(m.state, PetState::Idle, "stays put");
+    }
+
+    #[test]
+    fn summoned_to_a_corner_ends_at_the_screen_edge() {
+        let (mut m, d) = setup();
+        draw_circle(&mut m, &d, (1880.0, 40.0), 35.0, 30);
+        assert_eq!(m.state, PetState::Hunting);
+        run_until_idle(&mut m, &d, 4.0);
+        assert!((m.position.0 - (1920.0 - 128.0)).abs() < 1.0 && m.position.1.abs() < 1.0, "{:?}", m.position);
+    }
+
+    #[test]
+    fn drawing_another_circle_mid_run_changes_course() {
+        let (mut m, d) = setup();
+        draw_circle(&mut m, &d, (1500.0, 800.0), 80.0, 40);
+        assert_eq!(m.state, PetState::Hunting);
+        draw_circle(&mut m, &d, (200.0, 200.0), 80.0, 40);
+        run_until_idle(&mut m, &d, 4.0);
+        let (cx, cy) = m.center();
+        assert!((cx - 200.0).abs() < 15.0 && (cy - 200.0).abs() < 15.0, "{:?}", m.center());
+    }
+
+    #[test]
+    fn wiggles_whips_and_zigzags_do_not_summon() {
+        let (mut m, d) = setup();
+        let mut check = |m: &mut Monkey, what: &str| {
+            assert_ne!(m.state, PetState::Hunting, "{what} summoned him");
+        };
+        // Wide, fast side-to-side wiggle.
+        for i in 0..120 {
+            let x = 1200.0 + 400.0 * (i as f32 * 0.5).sin();
+            step(&mut m, &d, &[mv(x, 300.0 + (i % 3) as f32)]);
+        }
+        check(&mut m, "a wide wiggle");
+        // Diagonal back-and-forth.
+        for i in 0..120 {
+            let k = (i as f32 * 0.4).sin();
+            step(&mut m, &d, &[mv(1300.0 + 300.0 * k, 600.0 + 200.0 * k)]);
+        }
+        check(&mut m, "a diagonal wiggle");
+        // Whipping the cursor straight across the screen and back.
+        for i in 0..30 {
+            step(&mut m, &d, &[mv(100.0 + i as f32 * 60.0, 900.0)]);
+        }
+        for i in 0..30 {
+            step(&mut m, &d, &[mv(1900.0 - i as f32 * 60.0, 950.0)]);
+        }
+        check(&mut m, "a whip");
+        // A zig-zag scribble.
+        for i in 0..90 {
+            let x = 900.0 + i as f32 * 8.0;
+            let y = if (i / 6) % 2 == 0 { 200.0 + (i % 6) as f32 * 30.0 } else { 380.0 - (i % 6) as f32 * 30.0 };
+            step(&mut m, &d, &[mv(x, y)]);
+        }
+        check(&mut m, "a zig-zag");
+        // Half a circle.
+        for i in 0..=20 {
+            let a = i as f32 / 40.0 * 2.0 * PI;
+            step(&mut m, &d, &[mv(1500.0 + 100.0 * a.cos(), 700.0 + 100.0 * a.sin())]);
+        }
+        check(&mut m, "a semicircle");
+    }
+
+    #[test]
+    fn tiny_or_slow_circles_do_not_summon() {
+        let (mut m, d) = setup();
+        draw_circle(&mut m, &d, (1500.0, 300.0), 12.0, 30); // a jittery little loop
+        assert_ne!(m.state, PetState::Hunting, "tiny");
+        draw_circle(&mut m, &d, (1500.0, 700.0), 100.0, 200); // over 3 seconds
+        assert_ne!(m.state, PetState::Hunting, "slow");
+    }
+
+    #[test]
+    fn circling_while_typing_or_held_is_ignored() {
+        let (mut m, d) = setup();
+        step(&mut m, &d, &[key(KeyKind::Other)]);
+        draw_circle(&mut m, &d, (1500.0, 800.0), 80.0, 40);
+        assert_eq!(m.state, PetState::Typing);
     }
 
     #[test]
@@ -1140,18 +1344,5 @@ mod tests {
         fling(&mut m, &d, (560.0, 560.0), (60.0, 0.0));
         idle_for(&mut m, &d, 0.2);
         assert_ne!(m.state, PetState::Dramatic);
-    }
-
-    #[test]
-    fn chasing_a_cursor_in_the_corner_ends_at_the_screen_edge() {
-        let (mut m, d) = setup();
-        for i in 0..20 {
-            step(&mut m, &d, &[mv(600.0 + i as f32 * 66.0, 600.0 - i as f32 * 30.0)]);
-        }
-        assert_eq!(m.state, PetState::Hunting);
-        d.cursor.set((1919.0, 0.0));
-        idle_for(&mut m, &d, 3.0);
-        assert_ne!(m.state, PetState::Hunting, "reached the corner");
-        assert!((m.position.0 - (1920.0 - 128.0)).abs() < 1.0 && m.position.1.abs() < 1.0, "{:?}", m.position);
     }
 }

@@ -18,7 +18,7 @@ Inspired by [Comnyang](https://comnyang.com/en), the desktop cat.
 | **Drag him** | Gets picked up by the scruff, legs dangling. He stretches like mochi as you move him, more when you move faster, and wobbles back into shape when you let go. |
 | **Throw him** (let go mid-flick) | Tumbles through the air, bounces off the screen edges and lands on the bottom of the screen. |
 | **Stroke his head** (move the cursor side to side over it a few times) | Closes his eyes and purrs, with little hearts floating up. Keeps purring as long as you keep petting. |
-| **Whip the cursor across the screen** | Runs after it. If he catches it he celebrates, then takes a short breather before he'll chase again. |
+| **Draw a circle with the cursor** (one loop, anywhere on screen, in under 2 seconds) | Runs to that spot. He never stops inside the keep-out zone: if the circle is inside it, he stops just outside the zone at the edge nearest the circle. Draw another circle while he's running to change where he's going. |
 | **Leave the mouse alone for 5 minutes** | Wanders over to wherever the cursor is resting. |
 | **Scroll** (mouse wheel or two fingers on a touchpad) | Peels a banana a little with every notch of the wheel (about 12 notches), then eats it. Stop scrolling for a few seconds and he puts it away. |
 
@@ -113,7 +113,7 @@ RUST_LOG=info cargo run --release
 At startup this lists every input device and what it's used for
 (`evdev: /dev/input/event3: … (keyboard)`); the first key press prints
 `evdev: receiving key presses from <device>`, and state changes
-print lines like `Monkey: typing along.`, `Monkey: chasing the cursor.` or
+print lines like `Monkey: typing along.`, `Monkey: summoned by a circle at (1500, 800).` or
 `Monkey: landed.`
 
 ## Troubleshooting
